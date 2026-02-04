@@ -1,5 +1,7 @@
-data/
-__pycache__/
-*.ipynb_checkpoints
-.env
-.DS_Store
+# Ignore all files inside these folders
+data/*
+models/*
+
+# But allow the placeholder files so the folders appear on GitHub
+!data/.gitkeep
+!models/.gitkeep
