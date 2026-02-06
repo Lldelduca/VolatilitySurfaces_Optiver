@@ -1,10 +1,4 @@
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-import networkx as nx
 import pyvinecopulib as pv
-from scipy import stats
 
 # Fits a Static Mixed R-Vine Copula to the data
 def fit_static_mixed_vine(u_data):
@@ -19,16 +13,11 @@ def fit_static_mixed_vine(u_data):
             pv.BicopFamily.frank,    # Symmetric Body Dependence (No tails)
             pv.BicopFamily.clayton,  # Lower Tail (Crashes)
             pv.BicopFamily.gumbel,   # Upper Tail (Rallies)
-            pv.BicopFamily.joe,      # Sharp Upper Tail (Booms)
-            pv.BicopFamily.bb1,      # Asymmetric (Crash + Boom)
-            pv.BicopFamily.bb7,      # Asymmetric Alternative
-            pv.BicopFamily.bb8       # Asymmetric Alternative
         ],
         selection_criterion="bic",
         trunc_lvl=N-1,               # Fit full tree
-        tree_criterion="rho",        # Use correlation to order the tree 
-        allow_rotations=True,        # Enables negative correlations
-        num_threads = os.cpu_count()
+        tree_criterion="tau",        # Use correlation to order the tree 
+        allow_rotations=True         # Enables negative correlations
     )
 
     model = pv.Vinecop(d=N)
