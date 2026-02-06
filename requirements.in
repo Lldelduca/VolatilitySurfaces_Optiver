@@ -15,3 +15,4 @@ optuna
 networkx
 graphviz
 plotly
+torchvinecopulib
