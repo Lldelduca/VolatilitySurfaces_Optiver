@@ -16,3 +16,4 @@ networkx
 graphviz
 plotly
 torchvinecopulib
+polars
