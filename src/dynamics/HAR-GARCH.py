@@ -224,9 +224,13 @@ if __name__ == "__main__":
             params.append(p)
         
         u_df = pd.DataFrame(uniforms)
+        u_df.index = pd.to_datetime(u_df.index).date
+        u_df.index.name = "Date"
         u_df.to_csv(os.path.join(res_dir, "uniforms_har_garch_evt.csv"))
         
         p_df = pd.DataFrame(params)
+        cols = ['factor'] + [c for c in p_df.columns if c != 'factor']
+        p_df = p_df[cols]
         p_df.to_csv(os.path.join(res_dir, "har_garch_evt_params.csv"), index=False)
         
     else:

@@ -178,6 +178,8 @@ if __name__ == "__main__":
         })
     
     u_df = pd.DataFrame(uniforms)
+    u_df.index = pd.to_datetime(u_df.index).date
+    u_df.index.name = "Date"
     u_df.to_csv(os.path.join(res_dir, "uniforms_ngarch_t.csv"))
 
     p_df = pd.DataFrame(params)
