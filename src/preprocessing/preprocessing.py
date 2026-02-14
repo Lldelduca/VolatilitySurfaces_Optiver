@@ -7,7 +7,7 @@ import datetime
 
 SCRIPT_DIR = Path(__file__).resolve().parent 
 BASE_DIR = SCRIPT_DIR.parent.parent
-INPUT_FILE = BASE_DIR / "data" / "raw" / "options_surfaces_data.parquet"
+INPUT_FILE = BASE_DIR / "data" / "processed" / "options_surfaces_data.parquet"
 SPLITS_FILE = BASE_DIR / "data" / "splits" / "splits.json"
 OUTPUT_DIR = BASE_DIR / "data" / "processed"
 OUTPUT_FILE = OUTPUT_DIR / "options_surfaces_data_cleaned.parquet"
