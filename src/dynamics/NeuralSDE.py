@@ -10,8 +10,10 @@ import optuna
 from sklearn.model_selection import TimeSeriesSplit
 import json
 import os
-#%%
+import pickle
+from EVT import EVT
 
+# %%
 class GRU_Encoder(nn.Module):
     def __init__(self, n_in, n_hidden, n_layers):
         super().__init__()
@@ -43,25 +45,28 @@ class DiffusionNet(nn.Module):
         features = self.encoder(x)
         return self.softplus(self.head(features)) + 1e-4
 
-class NeuralSDE:
+class NeuralSDE(nn.Module):
     def __init__(self, params, device='cuda' if torch.cuda.is_available() else 'cpu'):
+        super().__init__()
         self.params = params
         self.device = device
         self.n_lags = params.get('n_lags', 10)
         self.alpha_pit = params.get('alpha_pit', 100.0)
         
+        n_features = params.get('n_features', 1)
+
         self.pi_drift = DriftNet(
-            n_in=params['n_features'], 
+            n_in=n_features, 
             n_hidden=params['hidden_size'], 
             n_layers=params['n_layers'], 
-            n_out=params['n_features']
+            n_out=n_features
         ).to(device)
         
         self.pi_diff = DiffusionNet(
-            n_in=params['n_features'], 
+            n_in=n_features, 
             n_hidden=params['hidden_size'], 
             n_layers=params['n_layers'], 
-            n_out=params['n_features']
+            n_out=n_features
         ).to(device)
         
         self.optimizer = optim.AdamW(
@@ -130,7 +135,7 @@ class NeuralSDE:
         p_val = penalty_val if isinstance(penalty_val, float) else penalty_val.item()
         return loss.item(), nll.item(), p_val
 
-#%%
+# %%
 
 def prepare_data(data, n_lags, device):
     data = torch.tensor(data, dtype=torch.float32).to(device)
@@ -182,20 +187,20 @@ def train_model(model, data_numpy, n_epochs=1000, batch_size=256, verbose=True):
     return X, dX, dT, raw_data
 
 
-def optimize_hyperparameters(data_numpy, n_trials=20):
-    print(f"\n--- Starting Optimization ({n_trials} trials) ---")
+def optimize_hyperparameters(data_numpy, column_name, n_trials=20):
+    print(f"\n--- Starting Optimization for '{column_name}' ({n_trials} trials) ---")
 
     tscv = TimeSeriesSplit(n_splits=3)
     
     def objective(trial):
-        n_lags = trial.suggest_int("n_lags", 5, len(data_numpy)//3)
-        hidden_size = trial.suggest_categorical("hidden_size", [16, 32, 64])
+        n_lags = trial.suggest_int("n_lags", 5, min(100, len(data_numpy)//3))
+        hidden_size = trial.suggest_categorical("hidden_size", [16, 32, 64, 128])
         n_layers = trial.suggest_int("n_layers", 1, 4)
         lr = trial.suggest_float("lr", 1e-4, 1e-2, log=True)
         alpha_pit = trial.suggest_float("alpha_pit", 10.0, 200.0)
         
         config = {
-            'n_features': data_numpy.shape[1],
+            'n_features': data_numpy.shape[1], # Should be 1
             'n_lags': n_lags,
             'hidden_size': hidden_size,
             'n_layers': n_layers,
@@ -209,13 +214,15 @@ def optimize_hyperparameters(data_numpy, n_trials=20):
             
             train_data = data_numpy[train_idx]
             
+            # Adjust validation start to include lookback window
             val_start_adjusted = max(0, val_idx[0] - n_lags)
             val_data_extended = data_numpy[val_start_adjusted : val_idx[-1] + 1]
             
             model = NeuralSDE(config)
             
             try:
-                train_model(model, train_data, n_epochs=150, batch_size=256, verbose=False)
+                # Reduced epochs for optimization speed
+                train_model(model, train_data, n_epochs=100, batch_size=256, verbose=False)
             except Exception:
                 return float('inf')
             
@@ -245,67 +252,53 @@ def optimize_hyperparameters(data_numpy, n_trials=20):
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=n_trials)
 
-    print("\n--- Optimization Finished ---")
+    print(f"\n--- Optimization Finished for '{column_name}' ---")
     print(f"Best Params: {study.best_params}")
     return study.best_params
 
-def run_diagnostics(model, X, dX, dT, raw_data):
+def run_diagnostics(model, X, dX, dT, raw_data, column_name, save_path=None):
     model.pi_drift.eval()
     model.pi_diff.eval()
     
     losses = model.loss_history
-    df = pd.DataFrame(losses)
-    window = 10 
-    df['total_smooth'] = df['total'].rolling(window=window).mean()
-    df['penalty_smooth'] = df['penalty'].rolling(window=window).mean()
+    df_loss = pd.DataFrame(losses)
+    window = 50  
+    df_loss['total_smooth'] = df_loss['total'].rolling(window=window).mean()
+    df_loss['penalty_smooth'] = df_loss['penalty'].rolling(window=window).mean()
     
-    fig, ax1 = plt.subplots(figsize=(12, 5))
+    fig, ax1 = plt.subplots(figsize=(10, 4))
     color = 'tab:blue'
     ax1.set_xlabel('Epochs')
     ax1.set_ylabel('Total Loss (SymLog)', color=color)
-    ax1.plot(df['total'], color=color, alpha=0.15)
-    ax1.plot(df['total_smooth'], color=color, linewidth=2)
+    ax1.plot(df_loss['total'], color=color, alpha=0.15)
+    ax1.plot(df_loss['total_smooth'], color=color, linewidth=2)
     ax1.set_yscale('symlog')
     ax2 = ax1.twinx()
     color = 'tab:red'
     ax2.set_ylabel('PIT Penalty', color=color)
-    ax2.plot(df['penalty'], color=color, alpha=0.15, linestyle='--')
-    ax2.plot(df['penalty_smooth'], color=color, linewidth=2, linestyle='--')
-    plt.title("Training Convergence")
-    plt.show()
+    ax2.plot(df_loss['penalty'], color=color, alpha=0.15, linestyle='--')
+    ax2.plot(df_loss['penalty_smooth'], color=color, linewidth=2, linestyle='--')
+    plt.title(f"Training Convergence - {column_name}")
+    if save_path:
+        plt.savefig(os.path.join(save_path, "convergence.png"))
+    plt.close()
 
     with torch.no_grad():
         nu = model.pi_drift(X)
         sigma = model.pi_diff(X)
         pit = model.get_pit(nu, sigma, dX, dT).cpu().numpy()
         
-    n_feats = pit.shape[1]
-    cols = min(n_feats, 4)
-    rows = int(np.ceil(n_feats / cols))
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(15, 3*rows))
-    axes = axes.flatten() if n_feats > 1 else [axes]
-    
-    for i in range(n_feats):
-        ax = axes[i]
-        ax.hist(pit[:, i], bins=30, density=True, color='purple', alpha=0.6, edgecolor='black')
-        ax.axhline(1.0, color='red', lw=2, linestyle='--')
-        ax.set_title(f"Feature {i}: PIT Dist")
-        ax.set_yticks([])
-        
-    for j in range(n_feats, len(axes)): axes[j].axis('off')
-    plt.suptitle("PIT Diagnostics", y=1.02)
-    plt.tight_layout()
-    plt.show()
+    # Plot PIT Histogram for single feature
+    plt.figure(figsize=(6, 4))
+    plt.hist(pit[:, 0], bins=30, density=True, color='purple', alpha=0.6, edgecolor='black')
+    plt.axhline(1.0, color='red', lw=2, linestyle='--')
+    plt.title(f"PIT Distribution - {column_name}")
+    if save_path:
+        plt.savefig(os.path.join(save_path, "pit_dist.png"))
+    plt.close()
 
+    # Dynamics Check
     lookback = 200
-    n_features = raw_data.shape[1]
-    cols = min(n_features, 3)
-    rows = int(np.ceil(n_features / cols))
-    
-    fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows))
-    axes = axes.flatten() if n_features > 1 else [axes]
-    
     with torch.no_grad():
         subset_X = X[-lookback:]
         subset_dT = dT[-lookback:]
@@ -314,30 +307,46 @@ def run_diagnostics(model, X, dX, dT, raw_data):
         
     dt_vals = subset_dT.cpu().numpy().flatten()
     
+    actual_levels = raw_data[-lookback:, 0].cpu().numpy()
+    prev_levels = raw_data[-lookback-1:-1, 0].cpu().numpy()
+    
+    expected_path = prev_levels + all_drift[:, 0] * dt_vals
+    margin = 1.96 * all_vol[:, 0] * np.sqrt(dt_vals)
+    
+    plt.figure(figsize=(10, 5))
+    plt.plot(actual_levels, 'k.-', label='Actual', lw=1, alpha=0.7)
+    plt.plot(expected_path, 'r--', label='Drift', lw=1)
+    plt.fill_between(range(lookback), 
+                     expected_path - margin, 
+                     expected_path + margin, 
+                     color='green', alpha=0.2, label='95% Band')
+    plt.title(f"Dynamics Check - {column_name}")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    if save_path:
+        plt.savefig(os.path.join(save_path, "dynamics.png"))
+    plt.close()
+
+def fit_evt_on_residuals(Z_numpy):
+    n_samples, n_features = Z_numpy.shape
+    U_numpy = np.zeros_like(Z_numpy)
+    evt_models = []
+    
     for i in range(n_features):
-        ax = axes[i]
-        actual_levels = raw_data[-lookback:, i].cpu().numpy()
-        prev_levels = raw_data[-lookback-1:-1, i].cpu().numpy()
+        z_col = Z_numpy[:, i]
         
-        expected_path = prev_levels + all_drift[:, i] * dt_vals
-        margin = 1.96 * all_vol[:, i] * np.sqrt(dt_vals)
-        
-        ax.plot(actual_levels, 'k.-', label='Actual', lw=1, alpha=0.7)
-        ax.plot(expected_path, 'r--', label='Drift', lw=1)
-        ax.fill_between(range(lookback), 
-                        expected_path - margin, 
-                        expected_path + margin, 
-                        color='green', alpha=0.2, label='95% Band')
-        ax.set_title(f"Feature {i}")
-        ax.grid(True, alpha=0.3)
-        if i == 0: ax.legend(loc='upper left', fontsize='small')
+        evt = EVT()
+        evt.fit(z_col, lower_quantile=0.10, upper_quantile=0.10)
+        u_col = evt.transform(z_col)
+            
+        evt_models.append(evt)
+        U_numpy[:, i] = u_col
+            
+    return U_numpy, evt_models
 
-    for j in range(n_features, len(axes)): axes[j].axis('off')
-    plt.suptitle(f"Dynamics Check: All {n_features} Factors", y=1.02, fontsize=14)
-    plt.tight_layout()
-    plt.show()
-
-def save_artifacts(model, X, dX, dT, params, folder="../../../data/results"):
+def save_artifacts(model, X, dX, dT, params, column_name, base_folder="results"):
+    # Create column-specific folder
+    folder = os.path.join(base_folder, column_name)
     os.makedirs(folder, exist_ok=True)
     
     with open(f"{folder}/best_nsde_params.json", "w") as f:
@@ -357,26 +366,64 @@ def save_artifacts(model, X, dX, dT, params, folder="../../../data/results"):
         
     np.save(f"{folder}/nsde_standardized_residuals.npy", Z_numpy)
     
-    abs_path = os.path.abspath(folder)
-    print(f"\n[Success] Artifacts saved to: {abs_path}")
-    print(f"  - Model weights: best_nsde_model.pth")
-    print(f"  - Hyperparameters: best_nsde_params.json")
-    print(f"  - Residuals: nsde_standardized_residuals.npy (Shape: {Z_numpy.shape})")
+    U_numpy, evt_models = fit_evt_on_residuals(Z_numpy)
+        
+    np.save(f"{folder}/nsde_uniforms.npy", U_numpy)
+        
+    with open(f"{folder}/evt_models.pkl", "wb") as f:
+        pickle.dump(evt_models, f)
+        
+    print(f"   [Saved] {column_name} -> {folder}")
+    return folder
 
 if __name__ == "__main__":
-    T, M = 1000, 3
-    dummy_data = np.cumsum(np.random.randn(T, M), axis=0) 
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(script_dir, "all_factors.csv")
     
-    best_params = optimize_hyperparameters(dummy_data, n_trials=20)
+    if not os.path.exists(file_path):
+        print(f"Error: '{file_path}' not found.")
+        print("Make sure the CSV is in the same folder as this script.")
+        exit()
+
+    df_full = pd.read_csv(file_path, index_col=0, parse_dates=True)
+    df_full = df_full.dropna()
+    df_full = df_full.select_dtypes(include=[np.number])
     
-    print(f"\nTraining Final Model with Best Params: {best_params}")
-    best_config = best_params.copy()
-    best_config['n_features'] = M
+    print(f"Total Data Shape: {df_full.shape}")
+    print(f"Columns to process: {list(df_full.columns)}")
     
-    best_model = NeuralSDE(best_config)
-    X_train, dX_train, dT_train, raw_data = train_model(best_model, dummy_data, n_epochs=1000, verbose=True)
-    
-    if X_train is not None:
-        run_diagnostics(best_model, X_train, dX_train, dT_train, raw_data)
+    results_base_dir = os.path.join(script_dir, "results_per_column")
+    os.makedirs(results_base_dir, exist_ok=True)
+
+    # --- MAIN LOOP PER COLUMN ---
+    for col in df_full.columns:
+        print(f"\n{'='*50}")
+        print(f"PROCESSING COLUMN: {col}")
+        print(f"{'='*50}")
         
-        save_artifacts(best_model, X_train, dX_train, dT_train, best_params)
+        # Extract single column as (T, 1) array
+        col_data = df_full[[col]].values
+        
+        # 1. Optimize Hyperparameters for this specific column
+        # Increase n_trials for better results in production
+        best_params = optimize_hyperparameters(col_data, col, n_trials=20)
+        
+        # 2. Configure Model
+        best_config = best_params.copy()
+        best_config['n_features'] = 1  # Strictly univariate
+        
+        # 3. Train Final Model
+        print(f"Training Final Model for {col}...")
+        final_model = NeuralSDE(best_config)
+        X_train, dX_train, dT_train, raw_data_train = train_model(
+            final_model, 
+            col_data, 
+            n_epochs=1000, # Full training epochs
+            verbose=True
+        )
+        
+        # 4. Save Artifacts & Diagnostics
+        if X_train is not None:
+            save_path = save_artifacts(final_model, X_train, dX_train, dT_train, best_params, col, base_folder=results_base_dir)
+            
+            run_diagnostics(final_model, X_train, dX_train, dT_train, raw_data_train, col, save_path=save_path)
