@@ -11,9 +11,12 @@ import os
 class NGARCH_T:
     def __init__(self):
         self.params = None
-        self.uniforms = None
+        self.train_uniforms = None
+        self.test_uniforms = None
         self.vol = None
+        self.test_vol = None
         self.resids = None
+        self.test_resids = None
         
     def _garch_vol(self, r, mu, omega, alpha, beta, theta):
         T = len(r)
@@ -43,50 +46,68 @@ class NGARCH_T:
         except:
             return 1e10
     
-    def fit(self, returns):
-        r = returns.values if isinstance(returns, pd.Series) else np.array(returns)
-        idx = returns.index if isinstance(returns, pd.Series) else None
+    def fit_and_predict(self, returns, holdout_days=248):
+        r_full = returns.values if isinstance(returns, pd.Series) else np.array(returns)
+        idx_full = returns.index if isinstance(returns, pd.Series) else None
+
+        r_train, idx_train = r_full[:-holdout_days], idx_full[:-holdout_days]
+        r_test, idx_test = r_full[-holdout_days:], idx_full[-holdout_days:]
         
-        # Initial values
-        mu0 = np.mean(r)
-        omega0 = 0.01 * np.var(r)
-        nu0 = max(2.1, 6.0 / max(0.1, pd.Series(r).kurtosis()) + 4.0)
+        mu0, omega0 = np.mean(r_train), 0.01 * np.var(r_train)
+        nu0 = max(2.1, 6.0 / max(0.1, pd.Series(r_train).kurtosis()) + 4.0)
         x0 = [mu0, omega0, 0.08, 0.90, 0.5, nu0]
-        
         bounds = [(None, None), (1e-8, None), (1e-6, 0.5), (0.0, 0.999), (-10, 10), (2.1, 100)]
-        
-        res = minimize(self._loglik, x0, args=(r,), method='L-BFGS-B', bounds=bounds,
+
+        # Fit
+        res = minimize(self._loglik, x0, args=(r_train,), method='L-BFGS-B', bounds=bounds,
                       options={'maxiter': 2000, 'ftol': 1e-10})
-        
         self.params = res.x
         mu, omega, alpha, beta, theta, nu = self.params
-        
-        self.vol = self._garch_vol(r, mu, omega, alpha, beta, theta)
-        self.resids = (r - mu) / self.vol
-        
-        u = student_t.cdf(self.resids, df=nu)
-        self.uniforms = pd.Series(np.clip(u, 1e-6, 1-1e-6), index=idx) if idx is not None else np.clip(u, 1e-6, 1-1e-6)
-        
+
+        # Filter
+        vol_full = self._garch_vol(r_full, mu, omega, alpha, beta, theta)
+        z_full = (r_full - mu) / vol_full
+        z_train, z_test = z_full[:-holdout_days], z_full[-holdout_days:]
+
+        # Map 
+        u_train = np.clip(student_t.cdf(z_train, df=nu), 1e-6, 1-1e-6)
+        u_test = np.clip(student_t.cdf(z_test, df=nu), 1e-6, 1-1e-6)
+
+        self.train_uniforms = pd.Series(u_train, index=idx_train)
+        self.test_uniforms = pd.Series(u_test, index=idx_test)
+
+        # Diagnostics
+        self.vol = vol_full[:-holdout_days]
+        self.test_vol = vol_full[-holdout_days:]
+        self.resids = z_train
+        self.test_resids = z_test
         return self
     
-    def diagnostics(self, name="Asset", save=None):
-        # Unpack parameters
+    def diagnostics(self, name="Asset", is_test=False, save=None):
+        # Swap between Train and Test data
         mu, omega, alpha, beta, theta, nu = self.params
-        z = self.resids
-        u = self.uniforms.values if isinstance(self.uniforms, pd.Series) else self.uniforms
+        z = self.test_resids if is_test else self.resids
+        u_series = self.test_uniforms if is_test else self.train_uniforms
+        u = u_series.values
+        vol_series = self.test_vol if is_test else self.vol
+        
+        phase = "Out-of-Sample (Test)" if is_test else "In-Sample (Train)"
         
         fig = plt.figure(figsize=(16, 12))
-        # Create a 3x3 grid
         gs = fig.add_gridspec(3, 3, hspace=0.3, wspace=0.3)
-        fig.suptitle(f'NGARCH-t Diagnostics: {name}', fontsize=14, fontweight='bold')
+        fig.suptitle(f'NGARCH-t Diagnostics [{phase}]: {name}', fontsize=14, fontweight='bold')
         
-        # 1. Residuals time series (Spanning the whole top row)
+        # 1. Realized Returns vs Predicted Volatility Bands
         ax0 = fig.add_subplot(gs[0, :])
-        ax0.plot(z, lw=0.5, alpha=0.7)
-        ax0.axhline(0, color='r', ls='--', lw=0.8)
-        ax0.axhline(2, color='orange', ls=':', lw=0.8)
-        ax0.axhline(-2, color='orange', ls=':', lw=0.8)
-        ax0.set_title('Standardized Residuals')
+
+        actual_returns = z * vol_series + mu
+        q95 = student_t.ppf(0.975, df=nu)
+
+        ax0.plot(u_series.index, actual_returns, lw=1, alpha=0.6, color='black', label='Realized Returns')
+        ax0.plot(u_series.index, mu + q95 * vol_series, 'r--', lw=1.5, label='Upper 95% Volatility Band')
+        ax0.plot(u_series.index, mu - q95 * vol_series, 'g--', lw=1.5, label='Lower 95% Volatility Band (VaR)')
+        ax0.set_title('Realized Returns vs. Predicted Conditional Volatility')
+        ax0.legend(loc='upper left')
         ax0.grid(alpha=0.3)
         
         # 2. Histogram
@@ -153,34 +174,37 @@ if __name__ == "__main__":
         
     diag_dir = os.path.join(res_dir, "plots", "ngarch")
     os.makedirs(diag_dir, exist_ok=True)
-    
-    df = pd.read_csv(data_path, index_col=0).apply(pd.to_numeric, errors='coerce')
+
+    HOLDOUT_DAYS = 248 # 2025 Split
+
+    df = pd.read_csv(data_path, index_col=0, parse_dates=True).apply(pd.to_numeric, errors='coerce')
     print(f"Shape: {df.shape}, Assets: {df.columns.tolist()}\n")
     
-    models = {}
-    uniforms = {}
-    params = []
-    
+    train_u, test_u, params = {}, {}, []
     for col in df.columns:        
         m = NGARCH_T()
-        m.fit(df[col].dropna())
+        m.fit_and_predict(df[col].dropna(), holdout_days=HOLDOUT_DAYS)
         
-        models[col] = m
-        uniforms[col] = m.uniforms
-        
-        m.diagnostics(name=col, save=os.path.join(diag_dir, f"{col}_diag.png"))
-        plt.close()
+        train_u[col] = m.train_uniforms
+        test_u[col] = m.test_uniforms
 
-        mu, omega, alpha, beta, theta, nu = models[col].params
+        # Plots
+        m.diagnostics(name=col, is_test=False, save=os.path.join(diag_dir, f"{col}_train_diag.png"))
+        m.diagnostics(name=col, is_test=True,  save=os.path.join(diag_dir, f"{col}_test_diag.png"))
+        plt.close('all')
+
+        mu, omega, alpha, beta, theta, nu = m.params
         params.append({
             'asset': col, 'mu': mu, 'omega': omega, 'alpha': alpha,
             'beta': beta, 'theta': theta, 'nu': nu, 'persistence': alpha + beta
         })
-    
-    u_df = pd.DataFrame(uniforms)
-    u_df.index = pd.to_datetime(u_df.index).date
-    u_df.index.name = "Date"
-    u_df.to_csv(os.path.join(res_dir, "uniforms_ngarch_t.csv"))
+        
+    train_df, test_df = pd.DataFrame(train_u), pd.DataFrame(test_u)
+    train_df.index, test_df.index = pd.to_datetime(train_df.index).date, pd.to_datetime(test_df.index).date
+    train_df.index.name, test_df.index.name = "Date", "Date"
+
+    train_df.to_csv(os.path.join(res_dir, "train_uniforms_ngarch_t.csv"))
+    test_df.to_csv(os.path.join(res_dir, "test_uniforms_ngarch_t.csv"))
 
     p_df = pd.DataFrame(params)
     p_df.to_csv(os.path.join(res_dir, "ngarch_t_params.csv"), index=False)
