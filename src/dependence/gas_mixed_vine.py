@@ -473,9 +473,11 @@ if __name__ == "__main__":
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
     res_dir = os.path.join(project_root, "outputs", "dynamics")
-    static_out_dir = os.path.join(project_root, "outputs", "copulas", "static")
-    out_dir = os.path.join(project_root, "outputs", "copulas", "gas")
+    static_out_dir = os.path.join(project_root, "outputs", "copulas")
+    out_dir = os.path.join(project_root, "outputs", "copulas")
+    graph_dir = os.path.join(project_root, "outputs", "copulas", "plots", "gas")
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(graph_dir, exist_ok=True)
 
     u_spot_file = os.path.join(res_dir, "train_uniforms_ngarch_t.csv")
     u_har_file = os.path.join(res_dir, "train_uniforms_har_garch_evt.csv")
@@ -509,8 +511,8 @@ if __name__ == "__main__":
         gas_fitted_models = fit_mixed_gas_vine(np_data, static_model)
 
         save_prefix = f"gas_vine_spot_{factor_name.lower().replace('-', '_')}"
-        plot_dynamic_tau_paths(gas_fitted_models, global_valid_dates, f"GAS {factor_name}", os.path.join(out_dir, f"{save_prefix}_dynamic_tau.png"))
+        plot_dynamic_tau_paths(gas_fitted_models, global_valid_dates, f"GAS {factor_name}", os.path.join(graph_dir, f"{save_prefix}_dynamic_tau.png"))
         
-        plot_gas_convergence(gas_fitted_models, f"GAS {factor_name}", os.path.join(out_dir, f"{save_prefix}_convergence.png"))
+        plot_gas_convergence(gas_fitted_models, f"GAS {factor_name}", os.path.join(graph_dir, f"{save_prefix}_convergence.png"))
         
         torch.save(gas_fitted_models, os.path.join(out_dir, f"{save_prefix}_model.pth"))

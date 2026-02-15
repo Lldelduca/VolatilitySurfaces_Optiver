@@ -164,7 +164,9 @@ if __name__ == "__main__":
 
     res_dir = os.path.join(project_root, "outputs", "dynamics")
     out_dir = os.path.join(project_root, "outputs", "copulas")
+    graph_dir = os.path.join(project_root, "outputs", "copulas", "plots", "static")
     os.makedirs(out_dir, exist_ok=True)
+    os.makedirs(graph_dir, exist_ok=True)
     
     u_spot_file = os.path.join(res_dir, "train_uniforms_ngarch_t.csv")
     u_har_file = os.path.join(res_dir, "train_uniforms_har_garch_evt.csv")
@@ -202,10 +204,10 @@ if __name__ == "__main__":
         # Diagnostics
         save_prefix = f"joint_vine_spot_{factor_name.lower().replace('-', '_')}"
         
-        plot_large_heatmap(combined_u, factor_name, os.path.join(out_dir, f"{save_prefix}_heatmap.png"))
-        plot_family_dist(joint_model, factor_name, os.path.join(out_dir, f"{save_prefix}_families.png"))
-        plot_simulated_vs_empirical(joint_model, combined_u, factor_name, os.path.join(out_dir, f"{save_prefix}_simulated.png"))
-        plot_tree1_network(combined_u, factor_name, os.path.join(out_dir, f"{save_prefix}_tree1_network.png"))
+        plot_large_heatmap(combined_u, factor_name, os.path.join(graph_dir, f"{save_prefix}_heatmap.png"))
+        plot_family_dist(joint_model, factor_name, os.path.join(graph_dir, f"{save_prefix}_families.png"))
+        plot_simulated_vs_empirical(joint_model, combined_u, factor_name, os.path.join(graph_dir, f"{save_prefix}_simulated.png"))
+        plot_tree1_network(combined_u, factor_name, os.path.join(graph_dir, f"{save_prefix}_tree1_network.png"))
 
         # Save Model 
         with open(os.path.join(out_dir, f"{save_prefix}_model.json"), "w") as f:

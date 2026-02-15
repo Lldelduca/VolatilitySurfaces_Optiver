@@ -5,9 +5,15 @@ import numpy as np
 from scipy.special import stdtrit, stdtr
 from scipy.stats import kendalltau, norm
 from tqdm import tqdm
+import pandas as pd
+import pyvinecopulib as pv
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import os
 
 torch.set_default_dtype(torch.float64)
 
+# CUSTOM AUTOGRAD FOR STUDENT-T
 class InverseStudentT(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, nu):
@@ -33,8 +39,7 @@ class InverseStudentT(torch.autograd.Function):
 def inverse_t_cdf(u, nu):
     return InverseStudentT.apply(u, nu)
 
-
-# NEURAL PAIR COPULA
+# NEURAL PAIR COPULA MODEL
 class NeuralPairCopula(nn.Module):
     def __init__(self, family, rotation=0, hidden_dim=10):
         super().__init__()
@@ -42,14 +47,10 @@ class NeuralPairCopula(nn.Module):
         self.rotation = int(rotation)
         
         # --- ARCHITECTURE: GRU ---
-        # Input: 2 dims (Transformed u_t, v_t)
-        # Hidden: 10 dims (Market State / Regime)
         self.rnn = nn.GRU(input_size=2, hidden_size=hidden_dim, batch_first=True)
-        
-        # Output Head: Maps Hidden State -> Parameter f_t
         self.head = nn.Linear(hidden_dim, 1)
+        self.f_init = nn.Parameter(torch.tensor(0.0))
         
-        # Student-t Degrees of Freedom (Learned Static)
         if 'student' in self.family:
             self.nu_param = nn.Parameter(torch.tensor(2.0))
         else:
@@ -66,13 +67,12 @@ class NeuralPairCopula(nn.Module):
         return u, v
     
     def transform_parameter(self, f_t):
-        """Maps Neural Output to Valid Parameter Space"""
         if 'gaussian' in self.family or 'student' in self.family:
-            return torch.tanh(f_t) * 0.999 # (-1, 1)
+            return torch.tanh(f_t) * 0.999 
         elif 'clayton' in self.family:
-            return torch.nn.functional.softplus(f_t) + 1e-5 # (>0)
+            return torch.nn.functional.softplus(f_t) + 1e-5 
         elif 'gumbel' in self.family:
-            return torch.nn.functional.softplus(f_t) + 1.0001 # (>1)
+            return torch.nn.functional.softplus(f_t) + 1.0001 
         elif 'frank' in self.family:
             val = f_t 
             mask = torch.abs(val) < 1e-4
@@ -81,7 +81,6 @@ class NeuralPairCopula(nn.Module):
         return f_t
 
     def log_likelihood_pair(self, u, v, theta, nu=None):
-        # EXACTLY SAME LOGIC AS GAS_MIXED_VINE.PY
         u_rot, v_rot = self.rotate_data(u, v)
         eps = 1e-9
         u_rot = torch.clamp(u_rot, eps, 1 - eps)
@@ -138,7 +137,6 @@ class NeuralPairCopula(nn.Module):
         return torch.zeros_like(u)
 
     def compute_h_func(self, u, v, theta, nu=None):
-        # EXACTLY SAME LOGIC AS GAS_MIXED_VINE.PY
         u_rot, v_rot = self.rotate_data(u, v)
         eps = 1e-9
         u_rot = torch.clamp(u_rot, eps, 1-eps)
@@ -174,50 +172,52 @@ class NeuralPairCopula(nn.Module):
         if self.rotation in [90, 270]: h_val = 1 - h_val
         return torch.clamp(h_val, eps, 1 - eps)
 
-    def forward(self, u_vec, v_vec):
-        """
-        Runs the GRU on the full sequence.
-        """
-        # 1. Probit Transform (Uniform[0,1] -> Normal(-inf, inf))
-        # Neural nets learn better from Gaussian inputs than Uniform inputs.
+def forward(self, u_vec, v_vec):
         eps = 1e-6
         u_clamped = torch.clamp(u_vec, eps, 1-eps)
         v_clamped = torch.clamp(v_vec, eps, 1-eps)
         
+        # Probit transform
         x_in = torch.erfinv(2 * u_clamped - 1) * 1.414
         y_in = torch.erfinv(2 * v_clamped - 1) * 1.414
         
-        # 2. Prepare for RNN (Batch=1, Seq=T, Feat=2)
-        # We assume u_vec, v_vec are (T,) tensors
         inputs = torch.stack([x_in, y_in], dim=1).unsqueeze(0) 
         
-        # 3. Run GRU
-        # out shape: (1, T, hidden_dim)
+        # rnn_out shape: (1, T, hidden_dim)
         rnn_out, _ = self.rnn(inputs)
         
-        # 4. Project to Parameter Space
-        # Shape: (T, 1) -> (T,)
+        # f_t_seq shape: (T,)
         f_t_seq = self.head(rnn_out).squeeze(0).squeeze(1)
         
-        # 5. Transform to Valid Theta
-        thetas = self.transform_parameter(f_t_seq)
+        # thetas_pred[t] is the forecast generated AFTER observing day t.
+        # Therefore, it is the prediction for day t+1.
+        thetas_pred = self.transform_parameter(f_t_seq)
         
-        # 6. Calculate Loss (Negative Log Likelihood)
-        # Note: In a true forecasting setting, we would shift: rnn_out[t] predicts theta[t+1].
-        # For this in-sample fitting, we model contemporaneous dependence.
+        # --- THE PREDICTIVE SHIFT ---
+        # To evaluate the likelihood of day t, we MUST use the prediction made on day t-1.
+        # For the very first day (t=0), we use our learnable initial parameter.
+        theta_0 = self.transform_parameter(self.f_init).unsqueeze(0)
+        
+        # theta_aligned[t] is now correctly the parameter applied to u_vec[t]
+        theta_aligned = torch.cat([theta_0, thetas_pred[:-1]])
+        
+        # Calculate valid Log-Likelihood
         nu = self.get_nu()
-        loss_vec = self.log_likelihood_pair(u_vec, v_vec, thetas, nu)
+        loss_vec = self.log_likelihood_pair(u_vec, v_vec, theta_aligned, nu)
         
-        return -torch.sum(loss_vec), thetas
+        # We save the very last prediction (thetas_pred[-1]) to the object itself.
+        # This is the "tomorrow" forecast! We will need this later for the OOS VaR Simulation.
+        self.oos_forecast = thetas_pred[-1].detach()
+        
+        # Return theta_aligned so the h_functions in the Vine builder use the correct historical paths
+        return -torch.sum(loss_vec), theta_aligned
 
-# NEURAL VINE FITTER
 def fit_neural_vine(u_matrix, structure, hidden_dim=10):
     T, N = u_matrix.shape
     device = torch.device("cpu")
     print(f"Fitting Neural GRU Vine on {device}...")
     u_tensor = torch.tensor(u_matrix, dtype=torch.float64).to(device)
     
-    # --- Matrix Processing (Same as GAS) ---
     M = np.array(structure.matrix, dtype=np.int64)
     if M.max() == N: M -= 1 
     top_density = np.sum(M[0] >= 0)
@@ -227,7 +227,6 @@ def fit_neural_vine(u_matrix, structure, hidden_dim=10):
     fams = structure.pair_copulas
     h_storage = {} 
     
-    # Initialize Tree -1
     for i in range(N):
         h_storage[(i, -1)] = u_tensor[:, i]
 
@@ -261,27 +260,19 @@ def fit_neural_vine(u_matrix, structure, hidden_dim=10):
                 h_direct = u_vec; h_indirect = v_vec
                 fitted_models[f"T{tree}_E{edge}"] = {'path': np.zeros(T), 'family': 'indep'}
             else:
-                # --- NEURAL MODEL HERE ---
                 model = NeuralPairCopula(fam_str, rotation=pc.rotation, hidden_dim=hidden_dim).to(device)
-                
-                # AdamW helps regularize neural weights
                 optimizer = optim.AdamW(model.parameters(), lr=0.01, weight_decay=1e-3)
                 loss_hist = []
 
-                # Neural Training Loop
-                for _ in range(50): # 50 epochs is usually enough for GRU on small data
+                for _ in range(50): 
                     optimizer.zero_grad()
-                    loss, _ = model(u_vec, v_vec) # Batch forward
+                    loss, _ = model(u_vec, v_vec) 
                     if torch.isnan(loss): break
                     loss.backward()
-                    
-                    # Gradient Clipping (Essential for RNN stability)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
                     optimizer.step()
                     loss_hist.append(loss.item())
                 
-                # Extract Path
                 _, theta_path = model(u_vec, v_vec)
                 theta_path = theta_path.detach()
                 
@@ -302,3 +293,118 @@ def fit_neural_vine(u_matrix, structure, hidden_dim=10):
             if tree < N - 2: h_storage[(partner_col, tree)] = h_indirect
                 
     return fitted_models
+
+# DIAGNOSTICS SUITE
+def theta_to_tau(family_str, theta_array):
+    fam = family_str.lower()
+    theta = np.array(theta_array, dtype=float)
+    if 'gaussian' in fam or 'student' in fam: return (2 / np.pi) * np.arcsin(theta)
+    elif 'clayton' in fam: return theta / (theta + 2)
+    elif 'gumbel' in fam: return 1 - (1 / theta)
+    elif 'frank' in fam: return theta / 10.0 
+    elif 'indep' in fam: return np.zeros_like(theta)
+    return theta
+
+def plot_dynamic_tau_paths(fitted_models, dates, name, save_path):
+    top_edges = [k for k in fitted_models.keys() if k.startswith("T0_E")][:3]
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
+    fig.suptitle(f"Dynamic Kendall's Tau Paths (Neural) - {name}", fontsize=18, fontweight='bold')
+    
+    for i, edge_key in enumerate(top_edges):
+        model_info = fitted_models[edge_key]
+        path = model_info['path'].flatten()
+        family = model_info['family'].capitalize()
+        tau_path = theta_to_tau(family, path)
+        if model_info.get('rotation', 0) in [90, 270]: tau_path = -tau_path
+            
+        ax = axes[i]
+        ax.plot(dates, tau_path, color='darkgreen', lw=1.5, label=f'{family} ($\\tau_t$)')
+        ax.axhline(0, color='black', linestyle='--', lw=1, alpha=0.5)
+        ax.set_title(f"Tree 1, Edge {i+1}", fontsize=14)
+        ax.set_ylim(-1, 1) 
+        ax.grid(alpha=0.3)
+        ax.legend(loc='upper left')
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        
+    plt.xlabel("Date", fontsize=14)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+def plot_neural_convergence(fitted_models, name, save_path):
+    top_edges = [k for k in fitted_models.keys() if k.startswith("T0_E")][:4]
+    plt.figure(figsize=(10, 6))
+    for edge_key in top_edges:
+        loss_hist = fitted_models[edge_key].get('loss_history', [])
+        if loss_hist:
+            plt.plot(loss_hist, lw=2, label=f'{edge_key} ({fitted_models[edge_key]["family"]})')
+            
+    plt.title(f"Neural GRU Optimization Convergence - {name}", fontsize=16)
+    plt.xlabel("AdamW Epochs")
+    plt.ylabel("Negative Log-Likelihood")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+if __name__ == "__main__":
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+
+    res_dir = os.path.join(project_root, "outputs", "dynamics")
+    static_out_dir = os.path.join(project_root, "outputs", "copulas")
+    out_dir = os.path.join(project_root, "outputs", "copulas", "neural")
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Load Train Data
+    u_spot_file = os.path.join(res_dir, "train_uniforms_ngarch_t.csv")
+    u_har_file = os.path.join(res_dir, "train_uniforms_har_garch_evt.csv")
+    u_nsde_file = os.path.join(res_dir, "train_nsde_uniforms.csv")
+
+    try:
+        u_spot = pd.read_csv(u_spot_file, index_col='Date', parse_dates=True)
+        u_har = pd.read_csv(u_har_file, index_col='Date', parse_dates=True)
+        u_nsde = pd.read_csv(u_nsde_file, index_col='Date', parse_dates=True)
+    except FileNotFoundError as e:
+        print(f"Error loading files.\n{e}")
+        exit()
+
+    # Intersect
+    global_valid_dates = u_spot.index.intersection(u_har.index).intersection(u_nsde.index)
+    u_spot = u_spot.loc[global_valid_dates]
+    u_har = u_har.loc[global_valid_dates]
+    u_nsde = u_nsde.loc[global_valid_dates]
+
+    factor_sets = {"HAR-GARCH-EVT": u_har, "NSDE": u_nsde}
+
+    for factor_name, u_factors in factor_sets.items():
+        print(f"\n--- Fitting Dynamic Neural Copula: Spot + {factor_name} ---")
+        
+        combined_u = pd.concat([u_spot, u_factors], axis=1)
+        np_data = combined_u.to_numpy()
+
+        # Load Static Baseline JSON
+        static_json_path = os.path.join(static_out_dir, f"joint_vine_spot_{factor_name.lower().replace('-', '_')}_model.json")
+        
+        if not os.path.exists(static_json_path):
+            print(f"ERROR: Cannot find static baseline JSON at {static_json_path}")
+            continue
+            
+        print("1. Loading frozen structure from Static Baseline...")
+        static_model = pv.Vinecop(static_json_path)
+
+        # Fit Neural Model
+        print("2. Fitting Dynamic Neural Updates via GRU...")
+        neural_fitted_models = fit_neural_vine(np_data, static_model, hidden_dim=10)
+        
+        # Diagnostics
+        save_prefix = f"neural_vine_spot_{factor_name.lower().replace('-', '_')}"
+        
+        plot_dynamic_tau_paths(neural_fitted_models, global_valid_dates, f"Neural {factor_name}", 
+                               os.path.join(out_dir, f"{save_prefix}_dynamic_tau.png"))
+        
+        plot_neural_convergence(neural_fitted_models, f"Neural {factor_name}", 
+                             os.path.join(out_dir, f"{save_prefix}_convergence.png"))
+
+        torch.save(neural_fitted_models, os.path.join(out_dir, f"{save_prefix}_model.pth"))
+        print(f"Saved Neural Model -> {save_prefix}_model.pth")
