@@ -7,6 +7,9 @@ import matplotlib.pyplot as plt
 from statsmodels.graphics.tsaplots import plot_acf
 from scipy.stats import probplot, kstest, norm, uniform
 import os
+import pickle
+
+from HAR_GARCH import HAR_GARCH_EVT
 
 class NGARCH_T:
     def __init__(self):
@@ -25,7 +28,8 @@ class NGARCH_T:
         
         for t in range(1, T):
             eps = r[t-1] - mu
-            z = eps / np.sqrt(sig2[t-1])
+            prev_sig = np.sqrt(sig2[t-1]) if sig2[t-1] > 1e-12 else 1e-6
+            z = eps / prev_sig
             sig2[t] = max(omega + alpha * ((z - theta)**2) * sig2[t-1] + beta * sig2[t-1], 1e-6)
         
         return np.sqrt(sig2)
@@ -48,45 +52,54 @@ class NGARCH_T:
         except:
             return 1e10
     
+    def predict_volatility(self, returns):
+        if self.params is None: raise ValueError("Model not fitted.")
+        mu, omega, alpha, beta, theta, nu = self.params
+        return self._garch_vol(returns, mu, omega, alpha, beta, theta)
+
+    def evaluate(self, test_returns, test_vol):
+        mu, _, _, _, _, nu = self.params
+        z = (test_returns - mu) / test_vol
+        ll_const = gammaln((nu + 1) / 2) - gammaln(nu / 2) - 0.5 * np.log(np.pi * nu)
+        loglik = np.sum(ll_const - ((nu + 1) / 2) * np.log(1 + z**2 / nu) - np.log(test_vol))
+        mse = np.mean(((test_returns - mu)**2 - test_vol**2)**2)
+        return loglik, mse
+
     def fit_and_predict(self, returns, holdout_days=248):
         r_full = returns.values if isinstance(returns, pd.Series) else np.array(returns)
         idx_full = returns.index if isinstance(returns, pd.Series) else None
 
-        r_train, idx_train = r_full[:-holdout_days], idx_full[:-holdout_days]
-        r_test, idx_test = r_full[-holdout_days:], idx_full[-holdout_days:]
+        r_train = r_full[:-holdout_days]
+        idx_train = idx_full[:-holdout_days]
+        idx_test = idx_full[-holdout_days:]
 
+        # Scaling for optimizer stability
         scale = 100.0
         r_train_scaled = r_train * scale
 
-        mu0 = np.mean(r_train_scaled)
-        omega0 = 0.05 * np.var(r_train_scaled)
-        nu0 = max(2.1, 6.0 / max(0.1, pd.Series(r_train).kurtosis()) + 4.0)
-        x0 = [mu0, omega0, 0.05, 0.90, 0.5, nu0]
-        bounds = [(None, None), (1e-8, None), (1e-6, 0.5), (0.0, 0.999), (-10, 10), (2.1, 100)]
+        x0 = [np.mean(r_train_scaled), 0.05 * np.var(r_train_scaled), 0.05, 0.90, 0.5, 6.0]
+        bounds = [(-10, 10), (1e-6, 10), (0.0, 0.5), (0.5, 0.99), (-5, 5), (2.1, 50)]
 
-        # Fit
-        res = minimize(self._loglik, x0, args=(r_train_scaled,), method='SLSQP', bounds=bounds, tol=1e-10)
+        res = minimize(self._loglik, x0, args=(r_train_scaled,), method='SLSQP', bounds=bounds, tol=1e-6)
+        
+        # Save state (Unscaling mu and omega)
         mu_s, omega_s, alpha, beta, theta, nu = res.x
-        self.params = [mu_s / scale, omega_s / (scale**2), alpha, beta, theta, nu]
-        mu, omega, alpha, beta, theta, nu = self.params
+        self.params = [mu_s/scale, omega_s/(scale**2), alpha, beta, theta, nu]
+        mu, omega, _, _, _, _ = self.params
 
-        # Filter
+        # Filter and store results
         vol_full = self._garch_vol(r_full, mu, omega, alpha, beta, theta)
         z_full = (r_full - mu) / vol_full
-        z_train, z_test = z_full[:-holdout_days], z_full[-holdout_days:]
-
-        # Map 
-        u_train = np.clip(student_t.cdf(z_train, df=nu), 1e-6, 1-1e-6)
-        u_test = np.clip(student_t.cdf(z_test, df=nu), 1e-6, 1-1e-6)
-
-        self.train_uniforms = pd.Series(u_train, index=idx_train)
-        self.test_uniforms = pd.Series(u_test, index=idx_test)
-
-        # Diagnostics
+        
+        u_full = np.clip(student_t.cdf(z_full, df=nu), 1e-6, 1-1e-6)
+        
+        self.train_uniforms = pd.Series(u_full[:-holdout_days], index=idx_train)
+        self.test_uniforms = pd.Series(u_full[-holdout_days:], index=idx_test)
         self.vol = vol_full[:-holdout_days]
         self.test_vol = vol_full[-holdout_days:]
-        self.resids = z_train
-        self.test_resids = z_test
+        self.resids = z_full[:-holdout_days]
+        self.test_resids = z_full[-holdout_days:]
+        
         return self
     
     def diagnostics(self, name="Asset", is_test=False, save=None):
@@ -105,12 +118,8 @@ class NGARCH_T:
         
         # 1. Realized Returns vs Predicted Volatility Bands
         ax0 = fig.add_subplot(gs[0, :])
-        ax0.plot(u_series.index, z, lw=0.5, alpha=0.7)
-        ax0.axhline(0, color='r', ls='--', lw=0.8)
-        ax0.axhline(2, color='orange', ls=':', lw=0.8)
-        ax0.axhline(-2, color='orange', ls=':', lw=0.8)
-        ax0.set_title('Standardized Residuals')
-        ax0.grid(alpha=0.3)
+        ax0.plot(z, lw=0.5, alpha=0.7)
+        ax0.set_title(f'Residuals (Alpha={alpha:.3f}, Beta={beta:.3f}, Theta={theta:.3f})')
         
         # 2. Histogram
         ax1 = fig.add_subplot(gs[1, 0])
@@ -163,6 +172,37 @@ class NGARCH_T:
             plt.savefig(save, dpi=300, bbox_inches='tight')
         return fig
 
+def plot_test_prediction(test_returns, test_vol, mu, nu, asset_name, save_path=None):
+    plt.figure(figsize=(12, 5))
+    
+    # Calculate the 95% CI bounds using the Student-t inverse CDF
+    # Student-t has fatter tails than Normal, so q will be > 1.96
+    t_quantile = student_t.ppf(0.975, df=nu)
+    
+    # Plot realized returns in the background
+    plt.plot(test_returns.index, test_returns, color='grey', alpha=0.4, label='Realized Returns', linewidth=1)
+    
+    # Plot predicted mean (mu)
+    point_pred = np.full(len(test_returns), mu)
+    plt.plot(test_returns.index, point_pred, color='blue', linewidth=1.5, label=f'Mean={mu:.4f})')
+    
+    # Calculate and plot the dynamic volatility bands
+    upper_bound = point_pred + t_quantile * test_vol
+    lower_bound = point_pred - t_quantile * test_vol
+    
+    plt.plot(test_returns.index, upper_bound, color='red', linestyle='--', alpha=0.8, label=f'95% CI (t-dist, q={t_quantile:.2f})')
+    plt.plot(test_returns.index, lower_bound, color='red', linestyle='--')
+    
+    # Shade the confidence area
+    plt.fill_between(test_returns.index, lower_bound, upper_bound, color='red', alpha=0.05)
+
+    plt.title(f"{asset_name} - Out-of-Sample Volatility Envelope (dof={nu:.2f})", fontsize=12, fontweight='bold')    
+    plt.legend(loc='upper left')
+    plt.grid(alpha=0.2)
+    
+    if save_path:
+        plt.savefig(save_path, bbox_inches='tight', dpi=300)
+    plt.close()
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -177,31 +217,57 @@ if __name__ == "__main__":
     diag_dir = os.path.join(res_dir, "plots", "ngarch")
     os.makedirs(diag_dir, exist_ok=True)
 
-    HOLDOUT_DAYS = 248 # 2025 Split
+    pred_dir = os.path.join(diag_dir, "predictions")
+    os.makedirs(pred_dir, exist_ok=True)
 
+    SPLIT_DATE = pd.Timestamp("2025-01-02")
     df = pd.read_csv(data_path, index_col=0, parse_dates=True).apply(pd.to_numeric, errors='coerce')
-    print(f"Shape: {df.shape}, Assets: {df.columns.tolist()}\n")
+    holdout_days = len(df[df.index >= SPLIT_DATE])
     
+    new_models = {}
     train_u, test_u, params = {}, {}, []
-    for col in df.columns:        
+    for col in df.columns:  
+        print(f"Fitting: {col}")      
         m = NGARCH_T()
-        m.fit_and_predict(df[col].dropna(), holdout_days=HOLDOUT_DAYS)
-        
+        m.fit_and_predict(df[col].dropna(), holdout_days=holdout_days)
+
+        new_models[col] = m
         train_u[col] = m.train_uniforms
         test_u[col] = m.test_uniforms
+
+        mu, omega, alpha, beta, theta, nu = m.params
+        persistence = alpha * (1 + theta**2) + beta
+        params.append({'asset': col, 'mu': mu, 'omega': omega, 'alpha': alpha,
+                       'beta': beta, 'theta': theta, 'nu': nu, 'persistence': persistence})
+
+        # Evaluaiton
+        mu_val, _, _, _, _, nu_val = m.params
+        test_series = df[col].tail(holdout_days)
+        plot_test_prediction(test_returns=test_series, test_vol=m.test_vol, mu=mu_val, nu=nu_val, 
+                             asset_name=col, save_path=os.path.join(pred_dir, f"{col}_vol_envelope.png"))
 
         # Plots
         m.diagnostics(name=col, is_test=False, save=os.path.join(diag_dir, f"{col}_train_diag.png"))
         m.diagnostics(name=col, is_test=True,  save=os.path.join(diag_dir, f"{col}_test_diag.png"))
         plt.close('all')
-
-        mu, omega, alpha, beta, theta, nu = m.params
-        persistence = alpha * (1 + theta**2) + beta
-        params.append({
-            'asset': col, 'mu': mu, 'omega': omega, 'alpha': alpha,
-            'beta': beta, 'theta': theta, 'nu': nu, 'persistence': persistence
-        })
         
+    # Save Model
+    model_pkl_path = os.path.join(res_dir, "fitted_marginals.pkl")
+    
+    if os.path.exists(model_pkl_path):
+        with open(model_pkl_path, "rb") as f:
+            all_models = pickle.load(f)
+        print(f"[-] Loaded existing pickle. Merging {len(new_models)} new models.")
+    else:
+        all_models = {}
+
+    all_models.update(new_models) # NGARCH models will overwrite/add to HAR models
+
+    with open(model_pkl_path, "wb") as f:
+        pickle.dump(all_models, f)
+    print(f"[-] Hybrid Model Library updated at: {model_pkl_path}")
+
+    # CSVs
     train_df, test_df = pd.DataFrame(train_u), pd.DataFrame(test_u)
     train_df.index, test_df.index = pd.to_datetime(train_df.index).date, pd.to_datetime(test_df.index).date
     train_df.index.name, test_df.index.name = "Date", "Date"
