@@ -172,7 +172,7 @@ class NeuralPairCopula(nn.Module):
         if self.rotation in [90, 270]: h_val = 1 - h_val
         return torch.clamp(h_val, eps, 1 - eps)
 
-def forward(self, u_vec, v_vec):
+    def forward(self, u_vec, v_vec):
         eps = 1e-6
         u_clamped = torch.clamp(u_vec, eps, 1-eps)
         v_clamped = torch.clamp(v_vec, eps, 1-eps)

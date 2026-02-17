@@ -124,7 +124,8 @@ def plot_family_dist(model, name, save_path):
 def plot_simulated_vs_empirical(model, u_df, name, save_path):
     """Simulates from the copula to verify goodness-of-fit on top pairs."""
     tau_matrix = u_df.corr(method='kendall').abs()
-    np.fill_diagonal(tau_matrix.values, 0)
+    for i in range(len(tau_matrix)):
+        tau_matrix.iloc[i, i] = 0.0  # Zero out diagonal to avoid self-pairs
     
     top_pairs = []
     for _ in range(3):
@@ -162,19 +163,28 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
-    res_dir = os.path.join(project_root, "outputs", "dynamics")
-    out_dir = os.path.join(project_root, "outputs", "copulas")
-    graph_dir = os.path.join(project_root, "outputs", "copulas", "plots", "static")
+    res_dir = os.path.join(project_root, "results", "dynamics")
+    out_dir = os.path.join(project_root, "results", "copulas", "static")
+    graph_dir = os.path.join(project_root, "results", "copulas", "static", "plots")
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
     
-    u_spot_file = os.path.join(res_dir, "train_uniforms_ngarch_t.csv")
-    u_har_file = os.path.join(res_dir, "train_uniforms_har_garch_evt.csv")
-    u_nsde_file = os.path.join(res_dir, "train_nsde_uniforms.csv")
+    u_spot_file = os.path.join(res_dir, "NGARCH", "train_uniforms_ngarch_t.csv")
+    u_har_file = os.path.join(res_dir, "HAR_GARCH", "train_uniforms_har_garch_evt.csv")
+    u_nsde_file = os.path.join(res_dir, "NSDE", "train_nsde_uniforms.csv")
 
     u_spot = pd.read_csv(u_spot_file, index_col='Date', parse_dates=True)
     u_har = pd.read_csv(u_har_file, index_col='Date', parse_dates=True)
     u_nsde = pd.read_csv(u_nsde_file, index_col='Date', parse_dates=True)
+
+    u_spot.index = pd.to_datetime(u_spot.index).normalize()
+    u_har.index = pd.to_datetime(u_har.index).normalize()
+    u_nsde.index = pd.to_datetime(u_nsde.index).normalize()
+
+    # 2. DEBUG PRINT: Let's see what the individual files actually hold
+    print(f"Spot Dates: {u_spot.index.min().date()} to {u_spot.index.max().date()} (N={len(u_spot)})")
+    print(f"HAR Dates : {u_har.index.min().date()} to {u_har.index.max().date()} (N={len(u_har)})")
+    print(f"NSDE Dates: {u_nsde.index.min().date()} to {u_nsde.index.max().date()} (N={len(u_nsde)})\n")
 
     # Find common dates and truncate to ensure comparability
     global_valid_dates = u_spot.index.intersection(u_har.index).intersection(u_nsde.index)

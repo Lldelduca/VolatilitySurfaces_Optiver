@@ -8,10 +8,11 @@ from tqdm import tqdm
 import matplotlib.dates as mdates
 import pyvinecopulib as pv
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import networkx as nx
+from joblib import Parallel, delayed
+import multiprocessing
 import json
 import os
 
@@ -289,10 +290,60 @@ class GASPairCopula(nn.Module):
 # ====================================================================================
 
 # VINE FITTER
+def fit_single_edge(tree, edge, M, fams, h_storage_subset, T):
+    # (We pass a subset of h_storage to avoid memory locking issues)
+    row = M.shape[0] - 1 - tree
+    col = edge
+    
+    var_1 = M[row, col]
+    u_vec = h_storage_subset['u']
+    v_vec = h_storage_subset['v']
+
+    pc = fams[tree][edge]
+    fam_str = str(pc.family)
+
+    if 'indep' in fam_str.lower():
+        return f"T{tree}_E{edge}", {'path': np.zeros(T), 'family': 'indep'}, u_vec, v_vec
+
+    # Force PyTorch to use 1 thread internally so multiple processes don't fight over cores
+    torch.set_num_threads(1)
+    
+    device = torch.device("cpu")
+    model = GASPairCopula(fam_str, rotation=pc.rotation).to(device)
+    model.warm_start(u_vec, v_vec)
+    
+    optimizer = optim.Adam(model.parameters(), lr=0.02)
+    loss_hist = []
+
+    for _ in range(30):
+        optimizer.zero_grad()
+        loss, _ = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
+        if torch.isnan(loss): break
+        loss.backward()
+        optimizer.step()
+        loss_hist.append(loss.item())
+    
+    _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
+    theta_path = theta_path.detach()
+    
+    nu_val = model.get_nu()
+    if nu_val is not None: nu_val = nu_val.detach()
+        
+    h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
+    h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
+    
+    result_dict = {
+        'loss_history': loss_hist,
+        'path': theta_path.numpy(),
+        'family': fam_str,
+        'rotation': pc.rotation
+    }
+    
+    return f"T{tree}_E{edge}", result_dict, h_direct, h_indirect
+
 def fit_mixed_gas_vine(u_matrix, structure):
     T, N = u_matrix.shape
     device = torch.device("cpu") 
-    print(f"Fitting GAS Vine on {device}...")
     u_tensor = torch.tensor(u_matrix, dtype=torch.float64).to(device)
     
     # Fix Dimensions and Matrix structure
@@ -313,15 +364,18 @@ def fit_mixed_gas_vine(u_matrix, structure):
         h_storage[(i, -1)] = u_tensor[:, i]
 
     fitted_models = {}
-    
+    num_cores = multiprocessing.cpu_count() - 1 # Leave 1 core for your OS
+    print(f"Parallelizing Vine Fitting across {num_cores} CPU cores...")
+
     for tree in range(N - 1):
         edges = N - 1 - tree
-        pbar = tqdm(range(edges), desc=f"Tree {tree+1}/{N-1}")
+        print(f"Fitting Tree {tree+1}/{N-1} ({edges} edges)...")
         
-        for edge in pbar:
+        # Prepare the data for parallel processing
+        tasks = []
+        for edge in range(edges):
             row = N - 1 - tree 
             col = edge
-            
             var_1 = M[row, col]
             u_vec = h_storage[(var_1, -1)] if tree == 0 else h_storage[(col, tree-1)]
             
@@ -335,50 +389,34 @@ def fit_mixed_gas_vine(u_matrix, structure):
                         partner_col = k; break
                 v_vec = h_storage[(partner_col, tree-1)]
 
-            # Stability
             u_vec = torch.nan_to_num(u_vec, 0.5)
             v_vec = torch.nan_to_num(v_vec, 0.5)
-
-            pc = fams[tree][edge]
-            fam_str = str(pc.family)
-
-            if 'indep' in fam_str.lower():
-                h_direct = u_vec; h_indirect = v_vec
-                fitted_models[f"T{tree}_E{edge}"] = {'path': np.zeros(T), 'family': 'indep'}
-            else:
-                model = GASPairCopula(fam_str, rotation=pc.rotation).to(device)
-                model.warm_start(u_vec, v_vec)
-                
-                optimizer = optim.Adam(model.parameters(), lr=0.02)
-                loss_hist = []
-
-                # Optimization
-                for _ in range(30):
-                    optimizer.zero_grad()
-                    loss, _ = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
-                    if torch.isnan(loss): break
-                    loss.backward()
-                    optimizer.step()
-                    loss_hist.append(loss.item())
-                
-                _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
-                theta_path = theta_path.detach()
-                
-                nu_val = model.get_nu()
-                if nu_val is not None: nu_val = nu_val.detach()
-                    
-                h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
-                h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
-                
-                fitted_models[f"T{tree}_E{edge}"] = {
-                    'loss_history': loss_hist,
-                    'path': theta_path.numpy(),
-                    'family': fam_str,
-                    'rotation': pc.rotation
-                }
-
-            h_storage[(col, tree)] = h_direct
-            if tree < N - 2: h_storage[(partner_col, tree)] = h_indirect
+            
+            tasks.append((tree, edge, M, fams, {'u': u_vec, 'v': v_vec}, T))
+            
+        # Execute edges in parallel USING THREADING to avoid pickling errors with PyTorch Autograd
+        results = Parallel(n_jobs=num_cores, prefer="threads")(
+            delayed(fit_single_edge)(*task) for task in tasks
+        )
+        
+        # Unpack results and update h_storage for the next tree
+        for res in results:
+            edge_key, model_dict, h_dir, h_indir = res
+            fitted_models[edge_key] = model_dict
+            
+            # Recalculate edge index for h_storage mapping
+            edge_idx = int(edge_key.split('_E')[1])
+            row = N - 1 - tree
+            var_2 = M[col, col]
+            partner_col = -1
+            if tree > 0:
+                for k in range(N):
+                    if M[row+1, k] == var_2:
+                        partner_col = k; break
+                        
+            h_storage[(edge_idx, tree)] = h_dir
+            if tree < N - 2: 
+                h_storage[(partner_col, tree)] = h_indir
                 
     return fitted_models
 
@@ -398,10 +436,6 @@ def theta_to_tau(family_str, theta_array):
     elif 'gumbel' in fam:
         return 1 - (1 / theta)
     elif 'frank' in fam:
-        # Frank has no closed form for tau, but we can approximate it or just return normalized theta 
-        # For visualization purposes, Frank tau is roughly theta / (theta + some_constant)
-        # But honestly, scipy or exact integration is needed for exact Frank tau.
-        # We will use the standard approximation for small/medium theta:
         return theta / 10.0 # simplified visual scaler
     elif 'indep' in fam:
         return np.zeros_like(theta)
@@ -472,16 +506,16 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
-    res_dir = os.path.join(project_root, "outputs", "dynamics")
-    static_out_dir = os.path.join(project_root, "outputs", "copulas")
-    out_dir = os.path.join(project_root, "outputs", "copulas")
-    graph_dir = os.path.join(project_root, "outputs", "copulas", "plots", "gas")
+    res_dir = os.path.join(project_root, "results", "dynamics")
+    static_out_dir = os.path.join(project_root, "results", "copulas", "static")
+    out_dir = os.path.join(project_root, "results", "copulas", "gas")
+    graph_dir = os.path.join(project_root, "results", "copulas", "gas", "plots")
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
 
-    u_spot_file = os.path.join(res_dir, "train_uniforms_ngarch_t.csv")
-    u_har_file = os.path.join(res_dir, "train_uniforms_har_garch_evt.csv")
-    u_nsde_file = os.path.join(res_dir, "train_nsde_uniforms.csv")
+    u_spot_file = os.path.join(res_dir, "NGARCH", "train_uniforms_ngarch_t.csv")
+    u_har_file = os.path.join(res_dir, "HAR_GARCH", "train_uniforms_har_garch_evt.csv")
+    u_nsde_file = os.path.join(res_dir, "NSDE", "train_nsde_uniforms.csv")
 
     u_spot = pd.read_csv(u_spot_file, index_col='Date', parse_dates=True)
     u_har = pd.read_csv(u_har_file, index_col='Date', parse_dates=True)
@@ -505,7 +539,7 @@ if __name__ == "__main__":
 
         # STEP 1: Determine the Structure via Static Vine
         static_json_path = os.path.join(static_out_dir, f"joint_vine_spot_{factor_name.lower().replace('-', '_')}_model.json")
-        static_model = pv.Vinecop(static_json_path)
+        static_model = pv.Vinecop.from_file(static_json_path)
 
         # STEP 2: Fit GAS
         gas_fitted_models = fit_mixed_gas_vine(np_data, static_model)
