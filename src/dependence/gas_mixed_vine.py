@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from scipy.special import stdtrit, stdtr
+import scipy.special
 from scipy.stats import kendalltau, norm
 from tqdm import tqdm
 import matplotlib.dates as mdates
@@ -18,19 +18,15 @@ import os
 
 torch.set_default_dtype(torch.float64)
 
-
-# CUSTOM AUTOGRAD FUNCTION: Inverse Student-t CDF
-# Implements the inverse CDF of Student-t distribution with custom gradient computation.
-# This is necessary because scipy's stdtrit doesn't have automatic differentiation support.
 class InverseStudentT(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, nu):
         u_cpu = u.detach().cpu().numpy()
         nu_cpu = nu.detach().cpu().numpy()
         u_cpu = np.clip(u_cpu, 1e-12, 1 - 1e-12)
-        x = stdtrit(nu_cpu, u_cpu)  # scipy's inverse Student-t CDF
+        # ADDED np.asarray() to safely handle 0D scalars
+        x = np.asarray(scipy.special.stdtrit(nu_cpu, u_cpu))
         x_tensor = torch.from_numpy(x).to(u.device, dtype=u.dtype)
-        # Save tensors for backward pass
         ctx.save_for_backward(x_tensor, u, nu)
         return x_tensor
 
@@ -38,8 +34,6 @@ class InverseStudentT(torch.autograd.Function):
     def backward(ctx, grad_output):
         x, u, nu = ctx.saved_tensors
         pi = torch.tensor(3.141592653589793, device=x.device, dtype=x.dtype)
-        
-        # Compute Student-t PDF using log-space for numerical stability
         log_const = torch.lgamma((nu + 1) / 2) - torch.lgamma(nu / 2) - 0.5 * torch.log(nu * pi)
         log_kernel = -((nu + 1) / 2) * torch.log(1 + (x**2) / nu)
         pdf = torch.exp(log_const + log_kernel)
@@ -50,12 +44,12 @@ class InverseStudentT(torch.autograd.Function):
         if ctx.needs_input_grad[1]:
             eps = 1e-4
             u_cpu = u.detach().cpu().numpy()
-            # Central difference: [F_inv(u, nu+eps) - F_inv(u, nu-eps)] / (2*eps)
             nu_p = (nu + eps).detach().cpu().numpy()
             nu_m = (nu - eps).detach().cpu().numpy()
-            x_p = stdtrit(nu_p, u_cpu)
-            x_m = stdtrit(nu_m, u_cpu)
-            dx_dnu = torch.from_numpy((x_p - x_m) / (2 * eps)).to(x.device, dtype=x.dtype)
+            x_p = scipy.special.stdtrit(nu_p, u_cpu)
+            x_m = scipy.special.stdtrit(nu_m, u_cpu)
+            # ADDED np.asarray() here too
+            dx_dnu = torch.from_numpy(np.asarray((x_p - x_m) / (2 * eps))).to(x.device, dtype=x.dtype)
             grad_nu = grad_output * dx_dnu
         
         return grad_u, grad_nu
@@ -63,19 +57,15 @@ class InverseStudentT(torch.autograd.Function):
 def inverse_t_cdf(u, nu):
     return InverseStudentT.apply(u, nu)
 
-# ==============================================================================================================================
-
-# GAS Copula 
 class GASPairCopula(nn.Module):
     def __init__(self, family, rotation=0):
         super().__init__()
         self.family = str(family).split('.')[-1].lower()
         self.rotation = int(rotation)
         
-        # GAS parameters
-        self.omega = nn.Parameter(torch.tensor(0.0))   # Constant level
-        self.A = nn.Parameter(torch.tensor(0.05))      # Score coefficient 
-        self.B_logit = nn.Parameter(torch.tensor(3.0)) # Persistence
+        self.omega = nn.Parameter(torch.tensor(0.0))
+        self.A = nn.Parameter(torch.tensor(0.05))
+        self.B_logit = nn.Parameter(torch.tensor(3.0))
         
         if 'student' in self.family:
             self.nu_param = nn.Parameter(torch.tensor(2.0))
@@ -97,19 +87,16 @@ class GASPairCopula(nn.Module):
     
     def transform_parameter(self, f_t):
         if 'gaussian' in self.family or 'student' in self.family:
-            # Correlation parameter for Gaussian/Student: bounded in (-1, 1)
             return torch.tanh(f_t) * 0.999
         elif 'clayton' in self.family:
-            # Clayton parameter must be > 0
             return torch.nn.functional.softplus(f_t) + 1e-5
         elif 'gumbel' in self.family:
-            # Gumbel parameter must be >= 1
             return torch.nn.functional.softplus(f_t) + 1.0001
         elif 'frank' in self.family:
-            # Frank parameter can be any real number except 0; add small threshold to avoid singularity
             val = f_t 
             mask = torch.abs(val) < 1e-4
-            val = torch.where(mask, torch.sign(val) * 1e-4, val)
+            # FIXED: Added epsilon inside the sign to strictly prevent 0.0 derivatives
+            val = torch.where(mask, torch.sign(val + 1e-12) * 1e-4, val)
             return val
         return f_t
     
@@ -118,30 +105,25 @@ class GASPairCopula(nn.Module):
             u_vec = u_vec.detach().cpu().numpy()
             v_vec = v_vec.detach().cpu().numpy()
         
-        # Compute empirical Kendall's tau
         tau, _ = kendalltau(u_vec, v_vec)
         if self.rotation in [90, 270]: tau = -tau
         
-        # Initialize f_t
         f_init = 0.0
         if 'gaussian' in self.family or 'student' in self.family:
-            # For Gaussian/Student: rho = sin(pi*tau/2)
             theta = np.sin(tau * np.pi / 2)
             f_init = np.arctanh(np.clip(theta, -0.99, 0.99))
         elif 'clayton' in self.family:
-            # Clayton: tau = theta / (theta + 2)
             theta = 2 * tau / (1 - tau) if tau < 1 else 0.1
             f_init = np.log(np.exp(max(theta, 1e-4)) - 1)
         elif 'gumbel' in self.family:
-            # Gumbel: tau = 1 - 1/theta
             theta = 1 / (1 - tau) if tau < 1 else 1.1
             f_init = np.log(np.exp(max(theta - 1.0, 1e-4)) - 1)
         elif 'frank' in self.family:
-            # Frank: approximate relationship
             f_init = 5 * tau 
 
         with torch.no_grad():
-            self.omega.copy_(torch.tensor(f_init * (1 - 0.95)))
+            # FIXED: omega is now the strict unconditional mean
+            self.omega.copy_(torch.tensor(f_init))
 
     def log_likelihood_pair(self, u, v, theta, nu=None):
         u_rot, v_rot = self.rotate_data(u, v)
@@ -150,7 +132,6 @@ class GASPairCopula(nn.Module):
         v_rot = torch.clamp(v_rot, eps, 1 - eps)
 
         if 'gaussian' in self.family:
-            # Gaussian copula: uses bivariate normal CDF with correlation rho
             rho = theta
             n = torch.distributions.Normal(0, 1)
             x, y = n.icdf(u_rot), n.icdf(v_rot)
@@ -164,7 +145,6 @@ class GASPairCopula(nn.Module):
             x = inverse_t_cdf(u_rot, nu)
             y = inverse_t_cdf(v_rot, nu)
             zeta = (x**2 + y**2 - 2*rho*x*y) / (1 - rho**2)
-            # Log-likelihood of bivariate Student-t
             term1 = -((nu + 2)/2) * torch.log(1 + zeta/nu)
             term2 = ((nu + 1)/2) * (torch.log(1 + x**2/nu) + torch.log(1 + y**2/nu))
             log_det = 0.5 * torch.log(1 - rho**2)
@@ -182,7 +162,6 @@ class GASPairCopula(nn.Module):
             t = theta
             x = -torch.log(u_rot)
             y = -torch.log(v_rot)
-            
             A = torch.pow(x**t + y**t, 1/t)
             term1 = torch.log(A + t - 1)
             term2 = -A
@@ -203,7 +182,6 @@ class GASPairCopula(nn.Module):
         
         return torch.zeros_like(u)
 
-    # Compute the conditional CDF (h-function) of u given v (h(u|v,theta) = dC(u,v)/dv)
     def compute_h_func(self, u, v, theta, nu=None):
         u_rot, v_rot = self.rotate_data(u, v)
         eps = 1e-9
@@ -214,14 +192,17 @@ class GASPairCopula(nn.Module):
         if 'gaussian' in self.family:
             n = torch.distributions.Normal(0, 1)
             x, y = n.icdf(u_rot), n.icdf(v_rot)
-            h_val = n.cdf((x - theta*y) / torch.sqrt(1 - theta**2))
+            denom = torch.sqrt(1 - theta**2 + 1e-8)
+            arg = (x - theta*y) / denom
+            arg = torch.nan_to_num(arg, nan=0.0)
+            h_val = n.cdf(arg)
 
         elif 'student' in self.family:
             x = inverse_t_cdf(u_rot, nu)
             y = inverse_t_cdf(v_rot, nu)
             factor = torch.sqrt((nu + 1) / (nu + y**2) / (1 - theta**2))
             arg = (x - theta * y) * factor
-            h_val = torch.tensor(stdtr((nu+1).detach().cpu().numpy(), arg.detach().cpu().numpy()))
+            h_val = torch.tensor(scipy.special.stdtr((nu+1).detach().cpu().numpy(), arg.detach().cpu().numpy()))
 
         elif 'clayton' in self.family:
             t = theta
@@ -230,10 +211,8 @@ class GASPairCopula(nn.Module):
 
         elif 'gumbel' in self.family:
             t = theta
-            # FIX: Separate lines here too
             x = -torch.log(u_rot)
             y = -torch.log(v_rot)
-            
             A = torch.pow(x**t + y**t, 1/t)
             h_val = torch.exp(-A) * torch.pow(y, t-1) / v_rot * torch.pow(x**t + y**t, 1/t - 1)
         
@@ -252,7 +231,7 @@ class GASPairCopula(nn.Module):
         f_t = self.omega.clone()
         B = self.get_B()
         nu = self.get_nu()
-        score_variance = torch.tensor(1.0)
+        score_variance = torch.tensor(1.0, device=u_data.device)
         alpha = 0.99 
         
         log_likes = []
@@ -260,28 +239,57 @@ class GASPairCopula(nn.Module):
         
         for t in range(T):
             theta_t = self.transform_parameter(f_t)
-            thetas.append(theta_t)
+            thetas.append(theta_t.view(-1)) # Force 1D
             
-            f_t_leaf = f_t.detach().requires_grad_(True)
-            theta_leaf = self.transform_parameter(f_t_leaf)
             u_t = u_data[t:t+1]
             v_t = v_data[t:t+1]
             
-            ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu)
+            u_rot, v_rot = self.rotate_data(u_t, v_t)
+            u_rot = torch.clamp(u_rot, 1e-9, 1 - 1e-9)
+            v_rot = torch.clamp(v_rot, 1e-9, 1 - 1e-9)
             
-            # Autograd.grad is essential for GAS score
-            score = torch.autograd.grad(ll, f_t_leaf, create_graph=False)[0]
+            # Hybrid Score Calculation: Closed-form for Gaussian/Student, Autograd for others
+            if 'gaussian' in self.family:
+                rho = theta_t
+                n = torch.distributions.Normal(0, 1)
+                x = n.icdf(u_rot)
+                y = n.icdf(v_rot)
+                # Keep it as a 1D tensor [1]
+                score = rho + (x * y * (1 + rho**2) - rho * (x**2 + y**2)) / (1 - rho**2 + 1e-8)
+                score = score.view(-1)
+                
+            elif 'student' in self.family:
+                rho = theta_t
+                x = inverse_t_cdf(u_rot, nu)
+                y = inverse_t_cdf(v_rot, nu)
+                zeta = (x**2 - 2*rho*x*y + y**2) / (1 - rho**2 + 1e-8)
+                w_t = (nu + 2) / (nu + zeta)
+                score = rho + w_t * (x * y * (1 + rho**2) - rho * (x**2 + y**2)) / (1 - rho**2 + 1e-8)
+                score = score.view(-1)
 
+            else:
+                f_t_leaf = f_t.detach().requires_grad_(True)
+                theta_leaf = self.transform_parameter(f_t_leaf)
+                ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu)
+                score = torch.autograd.grad(ll, f_t_leaf, create_graph=False)[0]
+                score = score.view(-1)
+            
             with torch.no_grad():
+                # Score is safely 1D now
                 score_val = score.item()
                 score_variance = alpha * score_variance + (1 - alpha) * (score_val**2)
                 scale = 1.0 / (torch.sqrt(score_variance) + 1e-8)
             
             scaled_score = score.detach() * scale
-            f_next = self.omega + self.A * scaled_score + B * f_t
+            scaled_score = torch.clamp(scaled_score, min=-10.0, max=10.0) 
             
-            ll_connected = self.log_likelihood_pair(u_t, v_t, theta_t, nu)
+            # f_next stays perfectly scaled
+            f_next = self.omega + self.A * scaled_score.squeeze() + B * f_t
+            
+            # Calculate daily likelihood and enforce 1D shape
+            ll_connected = self.log_likelihood_pair(u_t, v_t, theta_t, nu).view(-1)
             log_likes.append(ll_connected)
+            
             f_t = f_next
             
         return -torch.sum(torch.stack(log_likes)), torch.stack(thetas)
@@ -289,64 +297,94 @@ class GASPairCopula(nn.Module):
 
 # ====================================================================================
 
-# VINE FITTER
-def fit_single_edge(tree, edge, M, fams, h_storage_subset, T):
-    # (We pass a subset of h_storage to avoid memory locking issues)
-    row = M.shape[0] - 1 - tree
-    col = edge
-    
-    var_1 = M[row, col]
-    u_vec = h_storage_subset['u']
-    v_vec = h_storage_subset['v']
-
-    pc = fams[tree][edge]
-    fam_str = str(pc.family)
+# FIXED VINE FITTER
+def fit_single_edge(tree, edge, partner_col, fam_str, rotation, h_storage_subset, T):
+    """
+    Helper function for parallelization. 
+    Accepts strings/ints/numpy arrays to avoid PicklingErrors with C++ bindings.
+    """
+    # Convert numpy memmap arrays back to PyTorch tensors for autograd
+    u_vec = torch.tensor(h_storage_subset['u'], dtype=torch.float64)
+    v_vec = torch.tensor(h_storage_subset['v'], dtype=torch.float64)
 
     if 'indep' in fam_str.lower():
-        return f"T{tree}_E{edge}", {'path': np.zeros(T), 'family': 'indep'}, u_vec, v_vec
+        result_dict = {'loss_history': [], 'path': np.zeros(T), 'family': 'indep', 'rotation': 0,
+                       'omega': 0.0, 'A': 0.0, 'B': 0.0, 'nu': float('nan'), 'nll': 0.0, 'aic': 0.0, 'bic': 0.0}
+        return edge, partner_col, result_dict, u_vec, v_vec
 
-    # Force PyTorch to use 1 thread internally so multiple processes don't fight over cores
     torch.set_num_threads(1)
     
     device = torch.device("cpu")
-    model = GASPairCopula(fam_str, rotation=pc.rotation).to(device)
+    model = GASPairCopula(fam_str, rotation=rotation).to(device)
     model.warm_start(u_vec, v_vec)
     
     optimizer = optim.Adam(model.parameters(), lr=0.02)
     loss_hist = []
 
-    for _ in range(30):
+    # New hyper-parameters
+    max_epochs = 300
+    patience = 15
+    best_loss = float('inf')
+    patience_counter = 0
+
+    for epoch in range(max_epochs):
         optimizer.zero_grad()
         loss, _ = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
-        if torch.isnan(loss): break
+        
+        if torch.isnan(loss): 
+            break
+            
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
         optimizer.step()
-        loss_hist.append(loss.item())
+        
+        current_loss = loss.item()
+        loss_hist.append(current_loss)
+        
+        # Early Stopping Logic
+        normalized_loss = current_loss / T
+        if normalized_loss < best_loss - 1e-5:
+            best_loss = normalized_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            break
     
     _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
     theta_path = theta_path.detach()
+    theta_path = torch.nan_to_num(theta_path, nan=0.0)
     
     nu_val = model.get_nu()
-    if nu_val is not None: nu_val = nu_val.detach()
+    if nu_val is not None: 
+        nu_val = torch.nan_to_num(nu_val.detach(), nan=5.0)
         
     h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
     h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
+
+    if 'student' in fam_str:
+        k = 4 # omega, A, B, nu
+    else:
+        k = 3 # omega, A, B
     
-    result_dict = {
-        'loss_history': loss_hist,
-        'path': theta_path.numpy(),
-        'family': fam_str,
-        'rotation': pc.rotation
-    }
+    final_nll = loss_hist[-1] if loss_hist else float('nan')
     
-    return f"T{tree}_E{edge}", result_dict, h_direct, h_indirect
+    aic = 2 * k + 2 * final_nll
+    bic = k * np.log(T) + 2 * final_nll
+    
+    result_dict = {'loss_history': loss_hist, 'path': theta_path.numpy(),'family': fam_str, 'rotation': rotation,
+                   'omega': model.omega.item(), 'A': model.A.item(), 'B': model.get_B().item(), 
+                   'nu': nu_val.item() if nu_val is not None else float('nan'),
+                   'nll': final_nll, 'aic': aic, 'bic': bic}
+    
+    return edge, partner_col, result_dict, h_direct, h_indirect
 
 def fit_mixed_gas_vine(u_matrix, structure):
     T, N = u_matrix.shape
     device = torch.device("cpu") 
     u_tensor = torch.tensor(u_matrix, dtype=torch.float64).to(device)
     
-    # Fix Dimensions and Matrix structure
     M = np.array(structure.matrix, dtype=np.int64)
     if M.max() == N:
         M -= 1 
@@ -359,21 +397,20 @@ def fit_mixed_gas_vine(u_matrix, structure):
     fams = structure.pair_copulas
     h_storage = {} 
     
-    # Initialize Tree -1 (Raw Data)
     for i in range(N):
         h_storage[(i, -1)] = u_tensor[:, i]
 
     fitted_models = {}
-    num_cores = multiprocessing.cpu_count() - 1 # Leave 1 core for your OS
+    num_cores = multiprocessing.cpu_count() 
     print(f"Parallelizing Vine Fitting across {num_cores} CPU cores...")
 
     for tree in range(N - 1):
         edges = N - 1 - tree
         print(f"Fitting Tree {tree+1}/{N-1} ({edges} edges)...")
         
-        # Prepare the data for parallel processing
         tasks = []
         for edge in range(edges):
+            
             row = N - 1 - tree 
             col = edge
             var_1 = M[row, col]
@@ -391,29 +428,27 @@ def fit_mixed_gas_vine(u_matrix, structure):
 
             u_vec = torch.nan_to_num(u_vec, 0.5)
             v_vec = torch.nan_to_num(v_vec, 0.5)
+
+            # 1. Extract C++ PyVineCopulib info into picklable Python primitives
+            pc = fams[tree][edge]
+            fam_str = str(pc.family)
+            rotation = int(pc.rotation)
+
+            # 2. Convert to numpy so Joblib can use zero-copy memmap memory saving
+            u_np = torch.nan_to_num(u_vec, 0.5).numpy()
+            v_np = torch.nan_to_num(v_vec, 0.5).numpy()
             
-            tasks.append((tree, edge, M, fams, {'u': u_vec, 'v': v_vec}, T))
+            # Pack partner_col strictly into the task
+            tasks.append((tree, edge, partner_col, fam_str, rotation, {'u': u_np, 'v': v_np}, T))
             
-        # Execute edges in parallel USING THREADING to avoid pickling errors with PyTorch Autograd
-        results = Parallel(n_jobs=num_cores, prefer="threads")(
-            delayed(fit_single_edge)(*task) for task in tasks
-        )
-        
-        # Unpack results and update h_storage for the next tree
-        for res in results:
-            edge_key, model_dict, h_dir, h_indir = res
+        results = Parallel(n_jobs=-1, return_as="generator")(delayed(fit_single_edge)(*t) for t in tasks)
+
+        for res in tqdm(results, total=edges, desc=f"Tree {tree+1}/{N-1}"):
+            edge_idx, partner_col, model_dict, h_dir, h_indir = res
+            
+            edge_key = f"T{tree}_E{edge_idx}"
             fitted_models[edge_key] = model_dict
             
-            # Recalculate edge index for h_storage mapping
-            edge_idx = int(edge_key.split('_E')[1])
-            row = N - 1 - tree
-            var_2 = M[col, col]
-            partner_col = -1
-            if tree > 0:
-                for k in range(N):
-                    if M[row+1, k] == var_2:
-                        partner_col = k; break
-                        
             h_storage[(edge_idx, tree)] = h_dir
             if tree < N - 2: 
                 h_storage[(partner_col, tree)] = h_indir
@@ -421,86 +456,138 @@ def fit_mixed_gas_vine(u_matrix, structure):
     return fitted_models
 
 # Visualizations
-def theta_to_tau(family_str, theta_array):
-    """
-    Converts raw copula parameters into Kendall's Tau [-1, 1] for standardized plotting.
-    """
-    fam = family_str.lower()
-    # Ensure it's a numpy array
-    theta = np.array(theta_array, dtype=float)
+def print_gas_short_summary(fitted_gas):
+    total_nll = 0.0
+    total_aic = 0.0
+    total_bic = 0.0
     
-    if 'gaussian' in fam or 'student' in fam:
-        return (2 / np.pi) * np.arcsin(theta)
-    elif 'clayton' in fam:
-        return theta / (theta + 2)
-    elif 'gumbel' in fam:
-        return 1 - (1 / theta)
-    elif 'frank' in fam:
-        return theta / 10.0 # simplified visual scaler
-    elif 'indep' in fam:
-        return np.zeros_like(theta)
+    for info in fitted_gas.values():
+        total_nll += info.get('nll', 0.0)
+        total_aic += info.get('aic', 0.0)
+        total_bic += info.get('bic', 0.0)
+        
+    # Convert Negative Log-Likelihood back to standard Log-Likelihood
+    log_likelihood = -total_nll
+    
+    print(f"In-Sample Log-Likelihood: {log_likelihood:.2f}")
+    print(f"In-Sample AIC:            {total_aic:.2f}")
+    print(f"In-Sample BIC:            {total_bic:.2f}")
+
+def theta_to_tau(family_str, theta_array):
+    fam = family_str.lower()
+    theta = np.array(theta_array, dtype=float)
+    if 'gaussian' in fam or 'student' in fam: return (2 / np.pi) * np.arcsin(theta)
+    elif 'clayton' in fam: return theta / (theta + 2)
+    elif 'gumbel' in fam: return 1 - (1 / theta)
+    elif 'frank' in fam: return theta / 10.0
+    elif 'indep' in fam: return np.zeros_like(theta)
     return theta
 
 def plot_dynamic_tau_paths(fitted_gas, dates, name, save_path):
-    """
-    Plots the standardized time-varying Kendall's Tau (\tau_t) paths.
-    """
-    # Grab the top 3 edges connecting to the root node
-    top_edges = [k for k in fitted_gas.keys() if k.startswith("T0_E")][:3]
+    """PhD-quality plot for dynamic Kendall's Tau paths."""
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
     
-    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True)
-    fig.suptitle(f"Dynamic Kendall's Tau Paths (GAS) - {name}", fontsize=18, fontweight='bold')
+    top_edges = [k for k in fitted_gas.keys() if k.startswith("T0_E")][:3]
+    if not top_edges: return
+    
+    fig, axes = plt.subplots(len(top_edges), 1, figsize=(10, 2.5 * len(top_edges)), sharex=True)
+    if len(top_edges) == 1: axes = [axes]
     
     for i, edge_key in enumerate(top_edges):
         model_info = fitted_gas[edge_key]
         path = model_info['path'].flatten()
         family = model_info['family'].capitalize()
         
-        # Convert raw parameter to Kendall's Tau
         tau_path = theta_to_tau(family, path)
-        
-        # Handle rotations (if the copula was rotated 90 or 270 degrees, the correlation is negative)
-        if model_info['rotation'] in [90, 270]:
+        if model_info['rotation'] in [90, 270]: 
             tau_path = -tau_path
             
         ax = axes[i]
-        ax.plot(dates, tau_path, color='darkred', lw=1.5, label=f'{family} ($\\tau_t$)')
+        ax.plot(dates, tau_path, color='#1f77b4', lw=1.5, label=f'{family} Copula')
+        ax.axhline(0, color='black', linestyle='--', lw=1, alpha=0.7)
         
-        # Add a zero-line for reference
-        ax.axhline(0, color='black', linestyle='--', lw=1, alpha=0.5)
+        ax.set_ylabel(f"Kendall", fontsize=12)
+        ax.set_title(f"Tree 1, Edge {i+1} Dynamics", fontsize=12, fontweight='bold')
         
-        # Formatting
-        ax.set_title(f"Tree 1, Edge {i+1}", fontsize=14)
-        ax.set_ylim(-1, 1) # Standardized limits!
-        ax.grid(alpha=0.3)
-        ax.legend(loc='upper left')
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m'))
+        # Strict bounds for correlation visualization
+        ax.set_ylim(-1.05, 1.05)
+        ax.set_yticks([-1.0, -0.5, 0.0, 0.5, 1.0])
+        ax.legend(loc='upper right', frameon=True, shadow=False)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
         
-    plt.xlabel("Date", fontsize=14)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.savefig(save_path, dpi=300)
+    plt.xlabel("Year", fontsize=12)
+    sns.despine(left=True, bottom=True)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
 def plot_gas_convergence(fitted_gas, name, save_path):
-    """
-    Plots the Log-Likelihood loss history of the PyTorch Adam optimizer.
-    Proves to reviewers that the Neural/Autograd GAS update rule actually converged.
-    """
-    top_edges = [k for k in fitted_gas.keys() if k.startswith("T0_E")][:4]
+    """PhD-quality convergence plot, safe for grayscale printing."""
+    sns.set_theme(style="ticks", context="paper", font_scale=1.2)
     
-    plt.figure(figsize=(10, 6))
-    for edge_key in top_edges:
+    top_edges = [k for k in fitted_gas.keys() if k.startswith("T0_E")][:4]
+    if not top_edges: return
+    
+    plt.figure(figsize=(8, 5))
+    
+    # Use distinct line styles for grayscale printing
+    line_styles = ['-', '--', '-.', ':']
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    
+    for idx, edge_key in enumerate(top_edges):
         loss_hist = fitted_gas[edge_key]['loss_history']
+        fam = fitted_gas[edge_key]["family"].capitalize()
         if loss_hist:
-            plt.plot(loss_hist, lw=2, label=f'{edge_key} ({fitted_gas[edge_key]["family"]})')
+            # Shift the loss so it visualizes better if the scale is massive
+            plt.plot(loss_hist, lw=2, linestyle=line_styles[idx % 4], color=colors[idx % 4],
+                     label=f'{edge_key} ({fam})')
             
-    plt.title(f"GAS Autograd Optimization Convergence - {name}", fontsize=16)
-    plt.xlabel("Adam Epochs")
-    plt.ylabel("Negative Log-Likelihood")
-    plt.grid(alpha=0.3)
-    plt.legend()
+    plt.title(f"Optimization Convergence: {name}", fontsize=14, fontweight='bold')
+    plt.xlabel("Optimization Epoch", fontsize=12)
+    plt.ylabel("Negative Log-Likelihood", fontsize=12)
+    
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend(frameon=True, loc='best')
+    sns.despine()
+    
+    plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
+
+def save_vine_summary_csv(fitted_gas, save_path):
+    """Exports the GAS vine summary statistics to a CSV for easy LaTeX/Excel import."""
+    rows = []
+    total_nll, total_aic, total_bic = 0.0, 0.0, 0.0
+    
+    for edge_key, info in fitted_gas.items():
+        if info['family'] == 'indep':
+            rows.append([edge_key, 'Indep', 0, 0.0, 0.0, 0.0, float('nan'), 0.0, 0.0, 0.0])
+            continue
+            
+        rows.append([
+            edge_key, 
+            info['family'].capitalize(), 
+            info['rotation'], 
+            info['omega'], 
+            info['A'], 
+            info['B'], 
+            info['nu'], 
+            info['nll'], 
+            info['aic'], 
+            info['bic']
+        ])
+        
+        total_nll += info['nll']
+        total_aic += info['aic']
+        total_bic += info['bic']
+        
+    df = pd.DataFrame(rows, columns=['Edge', 'Family', 'Rotation', 'Omega', 'A', 'B', 'Nu', 'NLL', 'AIC', 'BIC'])
+    
+    # Append a final row for the Totals
+    totals_row = pd.DataFrame([['TOTAL', '-', '-', '-', '-', '-', '-', total_nll, total_aic, total_bic]], columns=df.columns)
+    df = pd.concat([df, totals_row], ignore_index=True)
+    
+    df.to_csv(save_path, index=False)
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -521,7 +608,6 @@ if __name__ == "__main__":
     u_har = pd.read_csv(u_har_file, index_col='Date', parse_dates=True)
     u_nsde = pd.read_csv(u_nsde_file, index_col='Date', parse_dates=True)
 
-    # Find common dates and truncate to ensure comparability
     global_valid_dates = u_spot.index.intersection(u_har.index).intersection(u_nsde.index)
     u_spot = u_spot.loc[global_valid_dates]
     u_har = u_har.loc[global_valid_dates]
@@ -537,16 +623,17 @@ if __name__ == "__main__":
         combined_u = pd.concat([u_spot, u_factors], axis=1)
         np_data = combined_u.to_numpy()
 
-        # STEP 1: Determine the Structure via Static Vine
         static_json_path = os.path.join(static_out_dir, f"joint_vine_spot_{factor_name.lower().replace('-', '_')}_model.json")
         static_model = pv.Vinecop.from_file(static_json_path)
 
-        # STEP 2: Fit GAS
         gas_fitted_models = fit_mixed_gas_vine(np_data, static_model)
+        print_gas_short_summary(gas_fitted_models)
 
         save_prefix = f"gas_vine_spot_{factor_name.lower().replace('-', '_')}"
+        csv_path = os.path.join(out_dir, f"{save_prefix}_summary.csv")
+        save_vine_summary_csv(gas_fitted_models, csv_path)
+
         plot_dynamic_tau_paths(gas_fitted_models, global_valid_dates, f"GAS {factor_name}", os.path.join(graph_dir, f"{save_prefix}_dynamic_tau.png"))
-        
         plot_gas_convergence(gas_fitted_models, f"GAS {factor_name}", os.path.join(graph_dir, f"{save_prefix}_convergence.png"))
         
         torch.save(gas_fitted_models, os.path.join(out_dir, f"{save_prefix}_model.pth"))
