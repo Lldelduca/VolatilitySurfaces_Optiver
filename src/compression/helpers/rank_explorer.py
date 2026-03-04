@@ -5,7 +5,7 @@ from skfda.preprocessing.dim_reduction import FPCA
 from skfda.representation.grid import FDataGrid
 
 import config.settings as g
-from src.compression.data_preparation import get_clean_4d_tensor
+from src.compression.helpers.data_preparation import get_clean_4d_tensor
 
 def find_total_variance_rank(r2_base, local_residual_variances, target_total_r2=96.0, max_rank=4):
     """
