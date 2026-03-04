@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
 from arch import arch_model
-from EVT import EVT
+from src.dynamics.EVT import EVT
 import matplotlib.pyplot as plt
 from statsmodels.graphics.tsaplots import plot_acf
 from scipy.stats import probplot, kstest, norm, uniform
@@ -54,18 +54,26 @@ class HAR_GARCH_EVT:
             har_model = LinearRegression()
             har_model.fit(X_train, Y_train, sample_weight=weights)
             res_train = Y_train - har_model.predict(X_train)
+
+            scale = 100.0
+            res_train_scaled = res_train * scale
             
-            garch = arch_model(res_train, vol='GARCH', p=1, q=1, mean='Zero', dist='normal', rescale=True)
+            garch = arch_model(res_train_scaled, vol='GARCH', p=1, q=1, mean='Zero', dist='normal', rescale=False)
             garch_res = garch.fit(disp='off', show_warning=False)
-            weights = 1.0 / (garch_res.conditional_volatility**2 + 1e-6)
+            
+            weights = 1.0 / ((garch_res.conditional_volatility / scale)**2 + 1e-6)
         
         self.har_model = har_model
         self.garch_model = garch_res
+        adj_omega = garch_res.params['omega'] / (scale**2)
+
         self.params = {
             'har_intercept': har_model.intercept_, 'har_daily': har_model.coef_[0],
             'har_weekly': har_model.coef_[1], 'har_monthly': har_model.coef_[2],
-            'garch_omega': garch_res.params['omega'], 'garch_alpha': garch_res.params['alpha[1]'],
-            'garch_beta': garch_res.params['beta[1]'], 'loglikelihood': garch_res.loglikelihood
+            'garch_omega': adj_omega, 
+            'garch_alpha': garch_res.params['alpha[1]'],
+            'garch_beta': garch_res.params['beta[1]'], 
+            'loglikelihood': garch_res.loglikelihood
         }
 
         # OOS + Filtering
@@ -188,9 +196,9 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
-    file_path = os.path.join(project_root, "outputs", "factors", "factors.csv")
-    res_dir = os.path.join(project_root, "outputs", "dynamics")
-    diag_dir = os.path.join(res_dir, "plots", "HAR-GARCH-EVT")
+    file_path = os.path.join(project_root, "results", "factors", "factors.csv")
+    res_dir = os.path.join(project_root, "results", "dynamics", "HAR-GARCH")
+    diag_dir = os.path.join(res_dir, "plots")
     os.makedirs(diag_dir, exist_ok=True)
 
     SPLIT_DATE = pd.Timestamp("2025-01-02")
@@ -238,6 +246,46 @@ if __name__ == "__main__":
         p_df = pd.DataFrame(params)
         p_df = p_df[['factor'] + [c for c in p_df.columns if c != 'factor']]
         p_df.to_csv(os.path.join(res_dir, "har_garch_evt_params.csv"), index=False)
+
+        # Create DataFrames from the dictionaries
+        train_df, test_df = pd.DataFrame(train_u), pd.DataFrame(test_u)
+        
+        # UNIFORMITY REPORT GENERATION
+        alpha = 0.05
+        failed_train = []
+        failed_test = []
+        
+        for col in df.columns:
+            _, p_train = kstest(train_u[col].dropna(), 'uniform')
+            _, p_test = kstest(test_u[col].dropna(), 'uniform')
+            
+            if p_train < alpha:
+                failed_train.append((col, p_train))
+            if p_test < alpha:
+                failed_test.append((col, p_test))
+
+        total_cols = len(df.columns)
+
+        print("\n" + "="*50)
+        print("📊 FINAL UNIFORMITY REPORT (HAR-GARCH-EVT)")
+        print("="*50)
+        
+        print("--- IN-SAMPLE (Train 2020-2024) ---")
+        if not failed_train:
+            print(f"✅ All {total_cols} factors passed uniformity (p > {alpha}).")
+        else:
+            print(f"❌ {len(failed_train)}/{total_cols} factors failed (p < {alpha}):")
+            for c, p in failed_train: 
+                print(f"   - {c:.<20} p: {p:.5f}")
+                
+        print("\n--- OUT-OF-SAMPLE (Test 2025) ---")
+        if not failed_test:
+            print(f"✅ All {total_cols} factors passed uniformity (p > {alpha}).")
+        else:
+            print(f"❌ {len(failed_test)}/{total_cols} factors failed (p < {alpha}):")
+            for c, p in failed_test: 
+                print(f"   - {c:.<20} p: {p:.5f}")
+        print("="*50)
 
         print(f"\nSuccess! Results and models saved in: {res_dir}")
     else:

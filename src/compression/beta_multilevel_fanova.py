@@ -1,4 +1,5 @@
 import numpy as np
+import random
 import pandas as pd
 import skfda
 from skfda.preprocessing.dim_reduction import FPCA
@@ -16,10 +17,12 @@ from src.compression.visualisation_function import plot_surfaces_for_latex
 
 if __name__ == "__main__":
     # --- Configuration ---
-    n_pc_global  = g.N_PC_GLOBAL
-    n_pc_local   = g.N_PC_LOCAL
+    n_pc_global   = g.N_PC_GLOBAL
+    n_pc_local    = g.N_PC_LOCAL
     plot_surfaces = True
-    train_slice  = slice(None, g.JAN_2025)
+    train_slice   = slice(None, g.JAN_2025)
+    np.random.seed(42)
+    random.seed(42)
 
     X_original = get_clean_4d_tensor()
     N_OBS, N_ASSETS, N_MAT, N_MON = X_original.shape
@@ -39,29 +42,28 @@ if __name__ == "__main__":
     def print_section(title):
         print(f"\n{SEP1}\n {title}\n{SEP1}")
 
-    def print_asset_local_table(symbol, r2_grand, r2_asset, r2_global, r2_local, pc_ratios, r2_ks):
-        # Dynamically calculate the top border length based on symbol length
+    def print_asset_local_table(symbol, 
+                                r2_g_tr, r2_a_tr, r2_o_tr, r2_l_tr, 
+                                r2_g_fu, r2_a_fu, r2_o_fu, r2_l_fu, 
+                                pc_ratios, r2_ks_tr, r2_ks_fu):
+        
         top_line = f"─ {symbol} "
-        pad_len = 76 - len(top_line) - 2
+        pad_len = WIDTH - len(top_line) - 2
         
         print(f"\n┌{top_line}{'─' * pad_len}┐")
-        print(f"│ {'Metric':<32} │ {'R²':>8} │ {'Δ R²':>10} │ {'% of Residual':>13} │")
-        print(f"├{'─'*34}┼{'─'*10}┼{'─'*12}┼{'─'*15}┤")
+        print(f"│ {'Metric':<31} │ {'R² (Train)':>10} │ {'R² (Full)':>10} │ {'% of Resid':>12} │")
+        print(f"├{'─'*33}┼{'─'*12}┼{'─'*12}┼{'─'*14}┤")
         
-        print(f"│ {'Grand Mean only':<32} │ {r2_grand:>8.4f} │ {'—':>10} │ {'—':>13} │")
-        print(f"│ {'+ Asset Bias':<32} │ {r2_asset:>8.4f} │ {r2_asset - r2_grand:>10.4f} │ {'—':>13} │")
-        print(f"│ {'+ Global (surface β, no int.)':<32} │ {r2_global:>8.4f} │ {r2_global - r2_asset:>10.4f} │ {'—':>13} │")
+        print(f"│ {'Grand Mean only':<31} │ {r2_g_tr:>10.4f} │ {r2_g_fu:>10.4f} │ {'—':>12} │")
+        print(f"│ {'+ Asset Bias':<31} │ {r2_a_tr:>10.4f} │ {r2_a_fu:>10.4f} │ {'—':>12} │")
+        print(f"│ {'+ Global (surface β, no int.)':<31} │ {r2_o_tr:>10.4f} │ {r2_o_fu:>10.4f} │ {'—':>12} │")
 
-        prev_r2 = r2_global
-        for k, (ratio, r2k) in enumerate(zip(pc_ratios, r2_ks)):
-            delta = r2k - prev_r2
-            # ratio*100 formatting takes 12 chars + 1 for the '%', total 13
-            print(f"│ {'+ Local PC ' + str(k+1):<32} │ {r2k:>8.4f} │ {delta:>10.4f} │ {ratio*100:>12.1f}% │")
-            prev_r2 = r2k
+        for k, (ratio, r2_tr, r2_fu) in enumerate(zip(pc_ratios, r2_ks_tr, r2_ks_fu)):
+            print(f"│ {'+ Local PC ' + str(k+1):<31} │ {r2_tr:>10.4f} │ {r2_fu:>10.4f} │ {ratio*100:>11.1f}% │")
 
-        print(f"├{'─'*34}┼{'─'*10}┼{'─'*12}┼{'─'*15}┤")
-        print(f"│ {'Total Explained (All Local PCs)':<32} │ {r2_local:>8.4f} │ {'—':>10} │ {'—':>13} │")
-        print(f"│ {'Unexplained Residual':<32} │ {1.0 - r2_local:>8.4f} │ {'—':>10} │ {'—':>13} │")
+        print(f"├{'─'*33}┼{'─'*12}┼{'─'*12}┼{'─'*14}┤")
+        print(f"│ {'Total Explained (All PCs)':<31} │ {r2_l_tr:>10.4f} │ {r2_l_fu:>10.4f} │ {'—':>12} │")
+        print(f"│ {'Unexplained Residual':<31} │ {1.0 - r2_l_tr:>10.4f} │ {1.0 - r2_l_fu:>10.4f} │ {'—':>12} │")
         print(f"└{'─'*74}┘")
 
     # ────────────────────────────────────────────────────────────────────
@@ -121,7 +123,7 @@ if __name__ == "__main__":
         fitted_j = X_reg @ B_j
         resid_j  = Y_j  - fitted_j
 
-        # R² logic
+        # R² logic (Train and Full)
         Y_tr_dm     = Y_j_train - Y_j_train.mean(axis=0)
         ss_total_tr = np.sum(Y_tr_dm ** 2)
         r2_train    = 1.0 - np.sum((Y_j_train - X_reg_train @ B_j) ** 2) / ss_total_tr
@@ -155,17 +157,32 @@ if __name__ == "__main__":
     local_scores_dict = {}
 
     for j, symbol in enumerate(g.SYMBOLS):
+        # Full Sample variables
         X_j = X_original[:, j, :, :]
+        X_j_dm = X_j - X_j.mean(axis=0)
+        ss_total_full = np.sum(X_j_dm ** 2)
 
-        X_j_dm   = X_j - X_j.mean(axis=0)
-        ss_total = np.sum(X_j_dm ** 2)
+        # Train Sample variables
+        X_j_train = X_j[train_slice]
+        X_j_dm_train = X_j_train - X_j_train.mean(axis=0)
+        ss_total_train = np.sum(X_j_dm_train ** 2)
 
-        r2_grand = 1.0 - np.sum((X_j - grand_mean) ** 2) / ss_total
-        r2_asset = 1.0 - np.sum((X_j - (grand_mean + asset_bias[j])) ** 2) / ss_total
+        # 1. Grand Mean R2
+        r2_grand_full = 1.0 - np.sum((X_j - grand_mean) ** 2) / ss_total_full
+        r2_grand_tr   = 1.0 - np.sum((X_j_train - grand_mean) ** 2) / ss_total_train
 
-        ols_full_fit = grand_mean + asset_bias[j] + ols_fitted[:, j, :, :]
-        r2_ols       = 1.0 - np.sum((X_j - ols_full_fit) ** 2) / ss_total
+        # 2. Asset Bias R2
+        r2_asset_full = 1.0 - np.sum((X_j - (grand_mean + asset_bias[j])) ** 2) / ss_total_full
+        r2_asset_tr   = 1.0 - np.sum((X_j_train - (grand_mean + asset_bias[j])) ** 2) / ss_total_train
 
+        # 3. Global OLS R2
+        ols_full_fit  = grand_mean + asset_bias[j] + ols_fitted[:, j, :, :]
+        ols_train_fit = ols_full_fit[train_slice]
+        
+        r2_ols_full = 1.0 - np.sum((X_j - ols_full_fit) ** 2) / ss_total_full
+        r2_ols_tr   = 1.0 - np.sum((X_j_train - ols_train_fit) ** 2) / ss_total_train
+
+        # Local FPCA on the residuals
         local_residuals_j = Residuals[:, j, :, :]
 
         fd_local = FDataGrid(
@@ -174,7 +191,6 @@ if __name__ == "__main__":
             dataset_name=f"Local_Residual_{symbol}"
         )
 
-        # Handle N_PC_LOCAL mapping safely
         M_j = g.N_PC_LOCAL[j] if isinstance(g.N_PC_LOCAL, (list, np.ndarray)) else n_pc_local
 
         fpca_local   = FPCA(n_components=M_j)
@@ -184,24 +200,36 @@ if __name__ == "__main__":
         fpca_per_asset[symbol]    = fpca_local
         local_scores_dict[symbol] = local_scores[:, :M_j]
 
+        # Reconstruct Full and Train
         local_recon_flat = (local_scores[:, :M_j] @ fpca_local.components_.data_matrix[:M_j].reshape(M_j, -1))
-        local_recon_surf = local_recon_flat.reshape(N_OBS, g.N_MATURITY, g.N_MONEYNESS)
+        local_recon_surf_full = local_recon_flat.reshape(N_OBS, g.N_MATURITY, g.N_MONEYNESS)
+        local_recon_surf_tr   = local_recon_surf_full[train_slice]
 
-        r2_local = 1.0 - np.sum((X_j - (ols_full_fit + local_recon_surf)) ** 2) / ss_total
+        # 4. Total Explained R2
+        r2_local_full = 1.0 - np.sum((X_j - (ols_full_fit + local_recon_surf_full)) ** 2) / ss_total_full
+        r2_local_tr   = 1.0 - np.sum((X_j_train - (ols_train_fit + local_recon_surf_tr)) ** 2) / ss_total_train
 
-        pc_ratios, r2_ks = [], []
+        pc_ratios, r2_ks_tr, r2_ks_full = [], [], []
         for k in range(M_j):
             pc_ratios.append(fpca_local.explained_variance_ratio_[k])
+            
             partial_flat = (local_scores[:, :k+1] @ fpca_local.components_.data_matrix[:k+1].reshape(k+1, -1))
-            partial_surf = partial_flat.reshape(N_OBS, g.N_MATURITY, g.N_MONEYNESS)
-            r2_ks.append(1.0 - np.sum((X_j - (ols_full_fit + partial_surf)) ** 2) / ss_total)
+            partial_surf_full = partial_flat.reshape(N_OBS, g.N_MATURITY, g.N_MONEYNESS)
+            partial_surf_tr   = partial_surf_full[train_slice]
+            
+            r2_ks_full.append(1.0 - np.sum((X_j - (ols_full_fit + partial_surf_full)) ** 2) / ss_total_full)
+            r2_ks_tr.append(1.0 - np.sum((X_j_train - (ols_train_fit + partial_surf_tr)) ** 2) / ss_total_train)
 
-        print_asset_local_table(symbol, r2_grand, r2_asset, r2_ols, r2_local, pc_ratios, r2_ks)
+        # Print the side-by-side table
+        print_asset_local_table(symbol, 
+                                r2_grand_tr, r2_asset_tr, r2_ols_tr, r2_local_tr, 
+                                r2_grand_full, r2_asset_full, r2_ols_full, r2_local_full, 
+                                pc_ratios, r2_ks_tr, r2_ks_full)
 
         if plot_surfaces:
             plot_surfaces_for_latex(
                 fpca_local.components_.data_matrix[:M_j].reshape(M_j, g.N_MATURITY, g.N_MONEYNESS),
-                f"results/factors/local/{symbol}",
+                f"results/figures/fpca/local/{symbol}",
                 color_multiplier=0.7
             )
 

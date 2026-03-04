@@ -9,7 +9,7 @@ from scipy.stats import probplot, kstest, norm, uniform
 import os
 import pickle
 
-from HAR_GARCH import HAR_GARCH_EVT
+from src.dynamics.HAR_GARCH import HAR_GARCH_EVT
 
 class NGARCH_T:
     def __init__(self):
@@ -54,8 +54,15 @@ class NGARCH_T:
     
     def predict_volatility(self, returns):
         if self.params is None: raise ValueError("Model not fitted.")
-        mu, omega, alpha, beta, theta, nu = self.params
-        return self._garch_vol(returns, mu, omega, alpha, beta, theta)
+        mu_unscaled, omega_unscaled, alpha, beta, theta, nu = self.params
+        
+        scale = 100.0
+        r_scaled = returns * scale
+        mu_scaled = mu_unscaled * scale
+        omega_scaled = omega_unscaled * (scale**2)
+        
+        vol_scaled = self._garch_vol(r_scaled, mu_scaled, omega_scaled, alpha, beta, theta)
+        return vol_scaled / scale
 
     def evaluate(self, test_returns, test_vol):
         mu, _, _, _, _, nu = self.params
@@ -82,14 +89,21 @@ class NGARCH_T:
 
         res = minimize(self._loglik, x0, args=(r_train_scaled,), method='SLSQP', bounds=bounds, tol=1e-6)
         
-        # Save state (Unscaling mu and omega)
+        # Save state (Keeping them in the SCALED space internally for predict_volatility consistency, 
+        # but reporting the unscaled version in self.params)
         mu_s, omega_s, alpha, beta, theta, nu = res.x
         self.params = [mu_s/scale, omega_s/(scale**2), alpha, beta, theta, nu]
-        mu, omega, _, _, _, _ = self.params
 
-        # Filter and store results
-        vol_full = self._garch_vol(r_full, mu, omega, alpha, beta, theta)
-        z_full = (r_full - mu) / vol_full
+        # --- THE FIX: Filter in the SCALED space, then downscale ---
+        r_full_scaled = r_full * scale
+        vol_full_scaled = self._garch_vol(r_full_scaled, mu_s, omega_s, alpha, beta, theta)
+        
+        # Downscale vol back to original return space
+        vol_full = vol_full_scaled / scale
+        
+        # z-scores remain the same because the scale cancels out (r*100 / vol*100 = r/vol)
+        mu_unscaled = mu_s / scale
+        z_full = (r_full - mu_unscaled) / vol_full
         
         u_full = np.clip(student_t.cdf(z_full, df=nu), 1e-6, 1-1e-6)
         
@@ -211,10 +225,10 @@ if __name__ == "__main__":
     script_dir = os.path.join(project_root, "data", "processed")
     data_path = os.path.join(script_dir, "returns.csv")
 
-    res_dir = os.path.join(project_root, "outputs", "dynamics")
+    res_dir = os.path.join(project_root, "outputs", "dynamics", "NGARCH-T")
     os.makedirs(res_dir, exist_ok=True)
         
-    diag_dir = os.path.join(res_dir, "plots", "ngarch")
+    diag_dir = os.path.join(res_dir, "plots")
     os.makedirs(diag_dir, exist_ok=True)
 
     pred_dir = os.path.join(diag_dir, "predictions")
@@ -277,5 +291,43 @@ if __name__ == "__main__":
 
     p_df = pd.DataFrame(params)
     p_df.to_csv(os.path.join(res_dir, "ngarch_t_params.csv"), index=False)
+
+    # Uniformity Report
+    alpha = 0.05
+    failed_train = []
+    failed_test = []
+
+    for col in df.columns:
+        # Run KS test on the generated uniforms
+        _, p_train = kstest(train_u[col].dropna(), 'uniform')
+        _, p_test = kstest(test_u[col].dropna(), 'uniform')
+        
+        if p_train < alpha:
+            failed_train.append((col, p_train))
+        if p_test < alpha:
+            failed_test.append((col, p_test))
+
+    total_cols = len(df.columns)
+
+    print("\n" + "="*50)
+    print("📊 FINAL UNIFORMITY REPORT (NGARCH-t)")
+    print("="*50)
+
+    print("--- IN-SAMPLE (Train 2020-2024) ---")
+    if not failed_train:
+        print(f"✅ All {total_cols} assets passed uniformity (p > {alpha}).")
+    else:
+        print(f"❌ {len(failed_train)}/{total_cols} assets failed (p < {alpha}):")
+        for c, p in failed_train: 
+            print(f"   - {c:.<20} p: {p:.5f}")
+            
+    print("\n--- OUT-OF-SAMPLE (Test 2025) ---")
+    if not failed_test:
+        print(f"✅ All {total_cols} assets passed uniformity (p > {alpha}).")
+    else:
+        print(f"❌ {len(failed_test)}/{total_cols} assets failed (p < {alpha}):")
+        for c, p in failed_test: 
+            print(f"   - {c:.<20} p: {p:.5f}")
+    print("="*50)
     
     print(f"\n\nParameters:\n{p_df[['asset', 'alpha', 'beta', 'persistence', 'theta', 'nu']]}")
