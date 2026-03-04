@@ -5,112 +5,22 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import networkx as nx
 import os
+import config.settings as g  # Ensure K_HAR_GARCH and K_NSDE are defined here!
 
-# Economic Subset Analysis for Truncation
-# --- Comprehensive Truncation Analysis (IS LL + Economic Subsets) ---
-def analyze_tree_subsets_and_is_ll(model, u_train, var_names, name, save_path):
-    d = len(var_names)
-    is_spot = {i: ('PC' not in var_names[i]) for i in range(d)}
-    json = model.to_json()
-    
-    # Safely extract and format the R-Vine Matrix
-    M = np.array(model.matrix, dtype=np.int64)
-    if M.max() == d: M = M - 1  
-    if np.sum(M[0] >= 0) > np.sum(M[-1] >= 0): M = np.flipud(M)
-        
-    results = []
-    max_tree = d - 1 
-    
-    print(f"\nAnalyzing Economic Subsets and In-Sample LL for {name} ({max_tree} trees)...")
-    
-    for tree_idx in range(max_tree): 
-        lvl = tree_idx + 1
-        spot_spot, spot_vol, vol_vol = 0, 0, 0
-        edges = d - 1 - tree_idx
-        row = d - 1 - tree_idx
-        
-        # --- A. Subset Analysis ---
-        for col in range(edges):
-            v1_spot = is_spot[M[row, col]]
-            v2_spot = is_spot[M[col, col]]
-            
-            if v1_spot and v2_spot: spot_spot += 1
-            elif not v1_spot and not v2_spot: vol_vol += 1
-            else: spot_vol += 1
-                
-        total_edges = spot_spot + spot_vol + vol_vol
-        pct_involving_spot = ((spot_spot + spot_vol) / total_edges) * 100 if total_edges > 0 else 0
-        
-        # --- B. In-Sample Log-Likelihood Analysis ---
-        # Load a fresh copy from JSON so .truncate() evaluates cleanly
-        trunc_model = pv.Vinecop.from_json(json) 
-        trunc_model.truncate(lvl) 
-        is_ll = trunc_model.loglik(u_train)
-        
-        results.append({
-            'Tree': lvl, 
-            'Spot_Spot': spot_spot,
-            'Spot_Vol': spot_vol,
-            'Vol_Vol': vol_vol,
-            'Pct_Involving_Spot': pct_involving_spot,
-            'IS_LL': is_ll
-        })
-        
-        print(f"  Tree {lvl:2d} | IS LL: {is_ll:.2f} | S-S: {spot_spot:2d}, S-V: {spot_vol:2d}, V-V: {vol_vol:2d} | Spot%: {pct_involving_spot:.1f}%")
+# =============================================================================
+# --- Model Fitting ---
+# =============================================================================
 
-    df_res = pd.DataFrame(results)
-    
-    # --- FIND OPTIMAL ECONOMIC TRUNCATION ---
-    # We truncate the moment Spot involvement drops below 5%
-    mask = df_res['Pct_Involving_Spot'] < 5.0
-    if mask.any():
-        optimal_k = int(df_res[mask]['Tree'].min()) - 1
-        optimal_k = max(1, optimal_k) 
-    else:
-        optimal_k = int(df_res['Tree'].max())
-        
-    print(f"\n>> Optimal Economic Truncation Level (Spot edges < 5%): Tree {optimal_k} <<")
-    
-    # --- PLOT DUAL-AXIS GRAPH ---
-    sns.set_theme(style="white", context="paper", font_scale=1.2)
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    
-    # Left Axis: Subsets (Bar Chart)
-    ax1.bar(df_res['Tree'], df_res['Spot_Spot'], label='Spot-Spot (Contagion)', color='darkblue', alpha=0.7)
-    ax1.bar(df_res['Tree'], df_res['Spot_Vol'], bottom=df_res['Spot_Spot'], label='Spot-Vol (Leverage)', color='darkred', alpha=0.7)
-    ax1.bar(df_res['Tree'], df_res['Vol_Vol'], bottom=df_res['Spot_Spot']+df_res['Spot_Vol'], label='Vol-Vol (Conditional Noise)', color='gray', alpha=0.4)
-    ax1.set_xlabel("Vine Tree Level", fontsize=14)
-    ax1.set_ylabel("Number of Edges (Subset Composition)", fontsize=14)
-    ax1.set_xticks(df_res['Tree'][::2])
-    
-    # Right Axis: In-Sample Log-Likelihood (Line Chart)
-    ax2 = ax1.twinx()
-    ax2.plot(df_res['Tree'], df_res['IS_LL'], color='darkgreen', marker='o', linewidth=3, markersize=6, label='In-Sample Log-Likelihood')
-    ax2.set_ylabel("In-Sample Log-Likelihood", color='darkgreen', fontsize=14)
-    ax2.tick_params(axis='y', labelcolor='darkgreen')
-    
-    # Highlight Optimal K
-    #ax1.axvline(x=optimal_k, color='black', linestyle='--', linewidth=2.5, label=f'Optimal Truncation ($K={optimal_k}$)')
-    
-    # Legends
-    lines_1, labels_1 = ax1.get_legend_handles_labels()
-    lines_2, labels_2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='center right', frameon=True, shadow=True)
-    
-    plt.title(f"Structural Validation & Economic Decay: {name}", fontsize=16, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    return optimal_k
-
-# --- Fits Final Static Mixed R-Vine Copula ---
 def fit_static_mixed_vine(u_data, optimal_trunc_lvl):
     T, N = u_data.shape
     controls = pv.FitControlsVinecop(
         family_set=[
-            pv.BicopFamily.indep, pv.BicopFamily.gaussian, pv.BicopFamily.student,
-            pv.BicopFamily.frank, pv.BicopFamily.clayton, pv.BicopFamily.gumbel,
+            pv.BicopFamily.indep, 
+            pv.BicopFamily.gaussian, 
+            pv.BicopFamily.student,
+            pv.BicopFamily.frank, 
+            pv.BicopFamily.clayton, 
+            pv.BicopFamily.gumbel,
         ],
         selection_criterion="aic",
         tree_criterion="tau",        
@@ -123,7 +33,10 @@ def fit_static_mixed_vine(u_data, optimal_trunc_lvl):
     model.select(u_data, controls=controls)
     return model
 
+# =============================================================================
 # --- Visualizations ---
+# =============================================================================
+
 def plot_tree1_network(u_df, name, save_path):
     # 1. Calculate empirical Kendall's Tau
     tau_matrix = u_df.corr(method='kendall')
@@ -249,6 +162,9 @@ def plot_simulated_vs_empirical(model, u_df, name, save_path):
     plt.savefig(save_path, dpi=300)
     plt.close()
 
+# =============================================================================
+# --- Main Execution Block ---
+# =============================================================================
 
 if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -260,10 +176,10 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
     
-    # --- LOAD FULL TRAIN DATA (100%) ---
-    u_spot_file = os.path.join(res_dir, "NGARCH", "train_uniforms_ngarch_t.csv")
-    u_har_file = os.path.join(res_dir, "HAR_GARCH", "train_uniforms_har_garch_evt.csv")
-    u_nsde_file = os.path.join(res_dir, "NSDE", "train_nsde_uniforms.csv")
+    # --- LOAD FULL TRAIN DATA ---
+    u_spot_file = os.path.join(res_dir, "NGARCH", "uniforms_ngarch_train.csv")
+    u_har_file = os.path.join(res_dir, "HAR_GARCH", "uniforms_har_garch_evt_train.csv")
+    u_nsde_file = os.path.join(res_dir, "NSDE", "uniforms_nsde_train.csv")
 
     u_spot = pd.read_csv(u_spot_file, index_col='Date', parse_dates=True)
     u_har = pd.read_csv(u_har_file, index_col='Date', parse_dates=True)
@@ -283,30 +199,25 @@ if __name__ == "__main__":
     factor_sets = {"HAR-GARCH-EVT": u_har, "NSDE": u_nsde}
 
     for factor_name, u_factors in factor_sets.items():
-        print(f"{'='*50}")
-        print(f"--- Fitting Joint Copula: Spot + {factor_name} ---")
+        print(f"\n{'='*50}")
+        print(f"--- Fitting Final Joint Copula: Spot + {factor_name} ---")
         print(f"{'='*50}")
 
         combined_u_train = pd.concat([u_spot, u_factors], axis=1)
         np_data_train = combined_u_train.to_numpy()
-        var_names = combined_u_train.columns.tolist()
         
+        # Pull the optimal K from your config file
+        if factor_name == "HAR-GARCH-EVT":
+            opt_level = g.K_HAR_GARCH
+        else:
+            opt_level = g.K_NSDE
+
         save_prefix = f"joint_vine_spot_{factor_name.lower().replace('-', '_')}"
-        T, d = np_data_train.shape
 
-        # 1. Fit Exploratory Model on 100% of Train Data
-        print(f"Fitting exploratory model (Full {d-1} Trees)...")
-        exploratory_model = fit_static_mixed_vine(np_data_train, optimal_trunc_lvl=d-1)
-        
-        # 2. Comprehensive Analysis (IS LL + Economic Decay)
-        comp_plot_path = os.path.join(graph_dir, f"{save_prefix}_comprehensive_truncation.png")
-        opt_level = analyze_tree_subsets_and_is_ll(exploratory_model, np_data_train, var_names, factor_name, comp_plot_path)
-
-        # 3. Fit Final Model truncated at the optimal economic level
-        print(f"\nFitting final parsimonious model truncated at Tree {opt_level}...")
+        print(f"Fitting parsimonious model truncated at Tree {opt_level}...")
         joint_model = fit_static_mixed_vine(np_data_train, optimal_trunc_lvl=opt_level)
 
-        # Print Final Statistics
+        # --- Print Final Statistics ---
         order = joint_model.order
         ordered_names = [combined_u_train.columns[int(i) - 1] for i in order]
         print("")
@@ -315,11 +226,14 @@ if __name__ == "__main__":
         print(f"In-Sample AIC:            {joint_model.aic(np_data_train):.2f}")
         print(f"In-Sample BIC:            {joint_model.bic(np_data_train):.2f}")
 
-        # Diagnostics & Save JSON
+        # --- Diagnostics & Plotting ---
+        print("\nGenerating Diagnostic Plots...")
         plot_large_heatmap(combined_u_train, factor_name, os.path.join(graph_dir, f"{save_prefix}_heatmap.png"))
         plot_family_dist(joint_model, factor_name, os.path.join(graph_dir, f"{save_prefix}_families.png"))
         plot_simulated_vs_empirical(joint_model, combined_u_train, factor_name, os.path.join(graph_dir, f"{save_prefix}_simulated.png"))
         plot_tree1_network(combined_u_train, factor_name, os.path.join(graph_dir, f"{save_prefix}_tree1_network.png"))
 
-        with open(os.path.join(out_dir, f"{save_prefix}_model.json"), "w") as f:
+        # --- Save Final JSON for GAS Model ---
+        json_path = os.path.join(out_dir, f"{save_prefix}_model.json")
+        with open(json_path, "w") as f:
             f.write(joint_model.to_json())
