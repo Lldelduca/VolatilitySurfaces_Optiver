@@ -225,7 +225,7 @@ if __name__ == "__main__":
     script_dir = os.path.join(project_root, "data", "processed")
     data_path = os.path.join(script_dir, "returns.csv")
 
-    res_dir = os.path.join(project_root, "outputs", "dynamics", "NGARCH-T")
+    res_dir = os.path.join(project_root, "results", "dynamics", "NGARCH-T")
     os.makedirs(res_dir, exist_ok=True)
         
     diag_dir = os.path.join(res_dir, "plots")
