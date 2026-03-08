@@ -8,6 +8,7 @@ from statsmodels.graphics.tsaplots import plot_acf
 from scipy.stats import probplot, kstest, norm, uniform
 import os
 import pickle
+import random
 
 from src.dynamics.HAR_GARCH import HAR_GARCH_EVT
 
@@ -219,6 +220,10 @@ def plot_test_prediction(test_returns, test_vol, mu, nu, asset_name, save_path=N
     plt.close()
 
 if __name__ == "__main__":
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 

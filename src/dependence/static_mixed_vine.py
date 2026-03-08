@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import networkx as nx
 import os
-import config.settings as g  # Ensure K_HAR_GARCH and K_NSDE are defined here!
+import config.settings as g
+import random
 
 # =============================================================================
 # --- Model Fitting ---
@@ -139,7 +140,10 @@ def plot_simulated_vs_empirical(model, u_df, name, save_path):
     pair_labels = ["Strongest Positive", "Strongest Negative", "Weakest (Independent)"]
 
     # Simulate from Copula
-    sim_u = model.simulate(n=len(u_df), seeds=[])
+    d = len(u_df.columns)
+    cpp_seeds = np.random.randint(0, 100000, size=d).tolist()
+    
+    sim_u = model.simulate(n=len(u_df), seeds=cpp_seeds)
     sim_df = pd.DataFrame(sim_u, columns=u_df.columns)
 
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
@@ -167,6 +171,10 @@ def plot_simulated_vs_empirical(model, u_df, name, save_path):
 # =============================================================================
 
 if __name__ == "__main__":
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 

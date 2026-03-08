@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import random
 
 def analyze_tree_subsets_interactive(model, u_train, var_names, name):
     d = len(var_names)
@@ -104,6 +105,10 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name):
     return chosen_k
 
 if __name__ == "__main__":
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
     res_dir = os.path.join(project_root, "results", "dynamics")

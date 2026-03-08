@@ -1,6 +1,10 @@
 import numpy as np
 from scipy.stats import genpareto, gaussian_kde
 from scipy.interpolate import interp1d
+import random
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
 
 # Three-region semi-parametric Extreme Value Theory (GDP and KDE)
 class EVT:

@@ -14,9 +14,16 @@ import networkx as nx
 from joblib import Parallel, delayed
 import multiprocessing
 import json
+import sys
 import os
+import random
 
 torch.set_default_dtype(torch.float64)
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.use_deterministic_algorithms(True, warn_only=True)
 
 class InverseStudentT(torch.autograd.Function):
     @staticmethod
@@ -48,9 +55,8 @@ class InverseStudentT(torch.autograd.Function):
             nu_m = (nu - eps).detach().cpu().numpy()
             x_p = scipy.special.stdtrit(nu_p, u_cpu)
             x_m = scipy.special.stdtrit(nu_m, u_cpu)
-            # ADDED np.asarray() here too
             dx_dnu = torch.from_numpy(np.asarray((x_p - x_m) / (2 * eps))).to(x.device, dtype=x.dtype)
-            grad_nu = grad_output * dx_dnu
+            grad_nu = (grad_output * dx_dnu).sum()
         
         return grad_u, grad_nu
 
@@ -99,31 +105,49 @@ class GASPairCopula(nn.Module):
             val = torch.where(mask, torch.sign(val + 1e-12) * 1e-4, val)
             return val
         return f_t
-    
-    def warm_start(self, u_vec, v_vec):
-        if isinstance(u_vec, torch.Tensor):
-            u_vec = u_vec.detach().cpu().numpy()
-            v_vec = v_vec.detach().cpu().numpy()
-        
-        tau, _ = kendalltau(u_vec, v_vec)
-        if self.rotation in [90, 270]: tau = -tau
-        
-        f_init = 0.0
-        if 'gaussian' in self.family or 'student' in self.family:
-            theta = np.sin(tau * np.pi / 2)
-            f_init = np.arctanh(np.clip(theta, -0.99, 0.99))
-        elif 'clayton' in self.family:
-            theta = 2 * tau / (1 - tau) if tau < 1 else 0.1
-            f_init = np.log(np.exp(max(theta, 1e-4)) - 1)
-        elif 'gumbel' in self.family:
-            theta = 1 / (1 - tau) if tau < 1 else 1.1
-            f_init = np.log(np.exp(max(theta - 1.0, 1e-4)) - 1)
-        elif 'frank' in self.family:
-            f_init = 5 * tau 
 
-        with torch.no_grad():
-            # FIXED: omega is now the strict unconditional mean
-            self.omega.copy_(torch.tensor(f_init))
+    def warm_start(self, u_vec, v_vec, static_theta=None, static_nu=None):
+        if static_theta is not None:
+            # Reverse-engineer the PyTorch parameter from the exact Static MLE
+            f_init = 0.0
+            if 'gaussian' in self.family or 'student' in self.family:
+                val = static_theta / 0.999
+                f_init = float(np.arctanh(np.clip(val, -0.999, 0.999)))
+            elif 'clayton' in self.family:
+                f_init = float(np.log(np.exp(max(static_theta - 1e-5, 1e-6)) - 1))
+            elif 'gumbel' in self.family:
+                f_init = float(np.log(np.exp(max(static_theta - 1.0001, 1e-6)) - 1))
+            elif 'frank' in self.family:
+                f_init = float(static_theta)
+
+            with torch.no_grad():
+                self.omega.copy_(torch.tensor(f_init))
+                if static_nu is not None and self.nu_param is not None:
+                    nu_init = float(np.log(np.exp(max(static_nu - 2.01, 1e-6)) - 1))
+                    self.nu_param.copy_(torch.tensor(nu_init))
+        else:
+            if isinstance(u_vec, torch.Tensor):
+                u_vec = u_vec.detach().cpu().numpy()
+                v_vec = v_vec.detach().cpu().numpy()
+            
+            tau, _ = kendalltau(u_vec, v_vec)
+            if self.rotation in [90, 270]: tau = -tau
+            
+            f_init = 0.0
+            if 'gaussian' in self.family or 'student' in self.family:
+                theta = np.sin(tau * np.pi / 2)
+                f_init = np.arctanh(np.clip(theta, -0.99, 0.99))
+            elif 'clayton' in self.family:
+                theta = 2 * tau / (1 - tau) if tau < 1 else 0.1
+                f_init = np.log(np.exp(max(theta, 1e-4)) - 1)
+            elif 'gumbel' in self.family:
+                theta = 1 / (1 - tau) if tau < 1 else 1.1
+                f_init = np.log(np.exp(max(theta - 1.0, 1e-4)) - 1)
+            elif 'frank' in self.family:
+                f_init = 5 * tau
+
+            with torch.no_grad():
+                self.omega.copy_(torch.tensor(f_init))
 
     def log_likelihood_pair(self, u, v, theta, nu=None):
         u_rot, v_rot = self.rotate_data(u, v)
@@ -241,9 +265,9 @@ class GASPairCopula(nn.Module):
             theta_t = self.transform_parameter(f_t)
             thetas.append(theta_t.view(-1)) # Force 1D
             
-            u_t = u_data[t:t+1]
-            v_t = v_data[t:t+1]
-            
+            u_t = u_data[t:t+1].view(-1)
+            v_t = v_data[t:t+1].view(-1)
+
             u_rot, v_rot = self.rotate_data(u_t, v_t)
             u_rot = torch.clamp(u_rot, 1e-9, 1 - 1e-9)
             v_rot = torch.clamp(v_rot, 1e-9, 1 - 1e-9)
@@ -270,7 +294,7 @@ class GASPairCopula(nn.Module):
             else:
                 f_t_leaf = f_t.detach().requires_grad_(True)
                 theta_leaf = self.transform_parameter(f_t_leaf)
-                ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu)
+                ll = self.log_likelihood_pair(u_t, v_t, theta_leaf, nu).sum()
                 score = torch.autograd.grad(ll, f_t_leaf, create_graph=False)[0]
                 score = score.view(-1)
             
@@ -284,7 +308,7 @@ class GASPairCopula(nn.Module):
             scaled_score = torch.clamp(scaled_score, min=-10.0, max=10.0) 
             
             # f_next stays perfectly scaled
-            f_next = self.omega + self.A * scaled_score.squeeze() + B * f_t
+            f_next = self.omega + self.A * scaled_score.squeeze() + B * (f_t - self.omega)
             
             # Calculate daily likelihood and enforce 1D shape
             ll_connected = self.log_likelihood_pair(u_t, v_t, theta_t, nu).view(-1)
@@ -298,7 +322,7 @@ class GASPairCopula(nn.Module):
 # ====================================================================================
 
 # FIXED VINE FITTER
-def fit_single_edge(tree, edge, partner_col, fam_str, rotation, h_storage_subset, T):
+def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, h_storage_subset, T):
     """
     Helper function for parallelization. 
     Accepts strings/ints/numpy arrays to avoid PicklingErrors with C++ bindings.
@@ -316,14 +340,14 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, h_storage_subset
     
     device = torch.device("cpu")
     model = GASPairCopula(fam_str, rotation=rotation).to(device)
-    model.warm_start(u_vec, v_vec)
+    model.warm_start(u_vec, v_vec, static_theta, static_nu)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.02)
+    optimizer = optim.Adam(model.parameters(), lr=0.005)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5)
     loss_hist = []
 
-    # New hyper-parameters
     max_epochs = 300
-    patience = 15
+    patience = 35
     best_loss = float('inf')
     patience_counter = 0
 
@@ -340,10 +364,11 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, h_storage_subset
         
         current_loss = loss.item()
         loss_hist.append(current_loss)
+        scheduler.step(current_loss)
         
         # Early Stopping Logic
         normalized_loss = current_loss / T
-        if normalized_loss < best_loss - 1e-5:
+        if normalized_loss < best_loss - 1e-6:
             best_loss = normalized_loss
             patience_counter = 0
         else:
@@ -353,7 +378,7 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, h_storage_subset
             break
     
     _, theta_path = model(u_vec.unsqueeze(1), v_vec.unsqueeze(1))
-    theta_path = theta_path.detach()
+    theta_path = theta_path.detach().squeeze()
     theta_path = torch.nan_to_num(theta_path, nan=0.0)
     
     nu_val = model.get_nu()
@@ -401,8 +426,8 @@ def fit_mixed_gas_vine(u_matrix, structure):
         h_storage[(i, -1)] = u_tensor[:, i]
 
     fitted_models = {}
-    num_cores = multiprocessing.cpu_count() 
-    print(f"Parallelizing Vine Fitting across {num_cores} CPU cores...")
+    active_cores = 48
+    print(f"Parallelizing Vine Fitting across {active_cores} CPU cores...")
 
     for tree in range(N - 1):
         edges = N - 1 - tree
@@ -430,18 +455,27 @@ def fit_mixed_gas_vine(u_matrix, structure):
             v_vec = torch.nan_to_num(v_vec, 0.5)
 
             # 1. Extract C++ PyVineCopulib info into picklable Python primitives
-            pc = fams[tree][edge]
-            fam_str = str(pc.family)
-            rotation = int(pc.rotation)
+            if tree < len(fams):
+                pc = fams[tree][edge]
+                fam_str = str(pc.family)
+                rotation = int(pc.rotation)
+                # EXTRACT MLE PARAMETERS
+                params = pc.parameters.flatten()
+                static_theta = float(params[0]) if len(params) > 0 else None
+                static_nu = float(params[1]) if len(params) > 1 else None
+            else:
+                fam_str = "indep"
+                rotation = 0
+                static_theta, static_nu = None, None
 
             # 2. Convert to numpy so Joblib can use zero-copy memmap memory saving
             u_np = torch.nan_to_num(u_vec, 0.5).numpy()
             v_np = torch.nan_to_num(v_vec, 0.5).numpy()
             
-            # Pack partner_col strictly into the task
-            tasks.append((tree, edge, partner_col, fam_str, rotation, {'u': u_np, 'v': v_np}, T))
+            # Pass static_theta and static_nu strictly into the task
+            tasks.append((tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, {'u': u_np, 'v': v_np}, T))
             
-        results = Parallel(n_jobs=-1, return_as="generator")(delayed(fit_single_edge)(*t) for t in tasks)
+        results = Parallel(n_jobs=48, return_as="generator")(delayed(fit_single_edge)(*t) for t in tasks)
 
         for res in tqdm(results, total=edges, desc=f"Tree {tree+1}/{N-1}"):
             edge_idx, partner_col, model_dict, h_dir, h_indir = res
@@ -600,9 +634,9 @@ if __name__ == "__main__":
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(graph_dir, exist_ok=True)
 
-    u_spot_file = os.path.join(res_dir, "NGARCH", "train_uniforms_ngarch_t.csv")
-    u_har_file = os.path.join(res_dir, "HAR_GARCH", "train_uniforms_har_garch_evt.csv")
-    u_nsde_file = os.path.join(res_dir, "NSDE", "train_nsde_uniforms.csv")
+    u_spot_file = os.path.join(res_dir, "NGARCH", "uniforms_ngarch_train.csv")
+    u_har_file = os.path.join(res_dir, "HAR_GARCH", "uniforms_har_garch_evt_train.csv")
+    u_nsde_file = os.path.join(res_dir, "NSDE", "uniforms_nsde_train.csv")
 
     u_spot = pd.read_csv(u_spot_file, index_col='Date', parse_dates=True)
     u_har = pd.read_csv(u_har_file, index_col='Date', parse_dates=True)
@@ -614,7 +648,13 @@ if __name__ == "__main__":
     u_nsde = u_nsde.loc[global_valid_dates]
     print(f"Evaluation Period: {global_valid_dates[0].date()} to {global_valid_dates[-1].date()}")
 
-    factor_sets = {"HAR-GARCH-EVT": u_har, "NSDE": u_nsde}
+    model_choice = sys.argv[1].upper() if len(sys.argv) > 1 else "ALL"
+    if model_choice == "HAR":
+        factor_sets = {"HAR-GARCH-EVT": u_har}
+    elif model_choice == "NSDE":
+        factor_sets = {"NSDE": u_nsde}
+    else:
+        factor_sets = {"HAR-GARCH-EVT": u_har, "NSDE": u_nsde}
 
     for factor_name, u_factors in factor_sets.items():
         print("")

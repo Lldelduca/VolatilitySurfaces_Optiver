@@ -8,7 +8,7 @@ from statsmodels.graphics.tsaplots import plot_acf
 from scipy.stats import probplot, kstest, norm, uniform
 import pickle
 import os
-
+import random
 
 class HAR_GARCH_EVT:
     def __init__(self, use_iterative_wls=True, max_iter=3):
@@ -193,6 +193,10 @@ class HAR_GARCH_EVT:
         return fig
 
 if __name__ == "__main__":
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
 
