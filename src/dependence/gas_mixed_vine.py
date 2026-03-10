@@ -31,7 +31,6 @@ class InverseStudentT(torch.autograd.Function):
         u_cpu = u.detach().cpu().numpy()
         nu_cpu = nu.detach().cpu().numpy()
         u_cpu = np.clip(u_cpu, 1e-12, 1 - 1e-12)
-        # ADDED np.asarray() to safely handle 0D scalars
         x = np.asarray(scipy.special.stdtrit(nu_cpu, u_cpu))
         x_tensor = torch.from_numpy(x).to(u.device, dtype=u.dtype)
         ctx.save_for_backward(x_tensor, u, nu)
@@ -101,14 +100,12 @@ class GASPairCopula(nn.Module):
         elif 'frank' in self.family:
             val = f_t 
             mask = torch.abs(val) < 1e-4
-            # FIXED: Added epsilon inside the sign to strictly prevent 0.0 derivatives
             val = torch.where(mask, torch.sign(val + 1e-12) * 1e-4, val)
             return val
         return f_t
 
     def warm_start(self, u_vec, v_vec, static_theta=None, static_nu=None):
         if static_theta is not None:
-            # Reverse-engineer the PyTorch parameter from the exact Static MLE
             f_init = 0.0
             if 'gaussian' in self.family or 'student' in self.family:
                 val = static_theta / 0.999
@@ -263,7 +260,7 @@ class GASPairCopula(nn.Module):
         
         for t in range(T):
             theta_t = self.transform_parameter(f_t)
-            thetas.append(theta_t.view(-1)) # Force 1D
+            thetas.append(theta_t.view(-1)) 
             
             u_t = u_data[t:t+1].view(-1)
             v_t = v_data[t:t+1].view(-1)
@@ -272,13 +269,11 @@ class GASPairCopula(nn.Module):
             u_rot = torch.clamp(u_rot, 1e-9, 1 - 1e-9)
             v_rot = torch.clamp(v_rot, 1e-9, 1 - 1e-9)
             
-            # Hybrid Score Calculation: Closed-form for Gaussian/Student, Autograd for others
             if 'gaussian' in self.family:
                 rho = theta_t
                 n = torch.distributions.Normal(0, 1)
                 x = n.icdf(u_rot)
                 y = n.icdf(v_rot)
-                # Keep it as a 1D tensor [1]
                 score = rho + (x * y * (1 + rho**2) - rho * (x**2 + y**2)) / (1 - rho**2 + 1e-8)
                 score = score.view(-1)
                 
@@ -299,7 +294,6 @@ class GASPairCopula(nn.Module):
                 score = score.view(-1)
             
             with torch.no_grad():
-                # Score is safely 1D now
                 score_val = score.item()
                 score_variance = alpha * score_variance + (1 - alpha) * (score_val**2)
                 scale = 1.0 / (torch.sqrt(score_variance) + 1e-8)
@@ -307,10 +301,8 @@ class GASPairCopula(nn.Module):
             scaled_score = score.detach() * scale
             scaled_score = torch.clamp(scaled_score, min=-10.0, max=10.0) 
             
-            # f_next stays perfectly scaled
             f_next = self.omega + self.A * scaled_score.squeeze() + B * (f_t - self.omega)
             
-            # Calculate daily likelihood and enforce 1D shape
             ll_connected = self.log_likelihood_pair(u_t, v_t, theta_t, nu).view(-1)
             log_likes.append(ll_connected)
             
@@ -321,13 +313,7 @@ class GASPairCopula(nn.Module):
 
 # ====================================================================================
 
-# FIXED VINE FITTER
-def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, h_storage_subset, T):
-    """
-    Helper function for parallelization. 
-    Accepts strings/ints/numpy arrays to avoid PicklingErrors with C++ bindings.
-    """
-    # Convert numpy memmap arrays back to PyTorch tensors for autograd
+def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, h_storage_subset, T, model_type):
     u_vec = torch.tensor(h_storage_subset['u'], dtype=torch.float64)
     v_vec = torch.tensor(h_storage_subset['v'], dtype=torch.float64)
 
@@ -342,12 +328,23 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
     model = GASPairCopula(fam_str, rotation=rotation).to(device)
     model.warm_start(u_vec, v_vec, static_theta, static_nu)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.005)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5)
-    loss_hist = []
+    # --- DYNAMIC OPTIMIZER SELECTION ---
+    if model_type == "NSDE":
+        optimizer = optim.Adam(model.parameters(), lr=0.01)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-5
+        )
+        patience = 35 # Allow a bit of time to settle after aggressive decay
+    else:
+        # Default for HAR
+        optimizer = optim.Adam(model.parameters(), lr=0.005)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=10, min_lr=1e-5
+        )
+        patience = 35
 
+    loss_hist = []
     max_epochs = 300
-    patience = 35
     best_loss = float('inf')
     patience_counter = 0
 
@@ -366,7 +363,6 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
         loss_hist.append(current_loss)
         scheduler.step(current_loss)
         
-        # Early Stopping Logic
         normalized_loss = current_loss / T
         if normalized_loss < best_loss - 1e-6:
             best_loss = normalized_loss
@@ -388,10 +384,8 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
     h_direct = model.compute_h_func(u_vec, v_vec, theta_path, nu_val)
     h_indirect = model.compute_h_func(v_vec, u_vec, theta_path, nu_val)
 
-    if 'student' in fam_str:
-        k = 4 # omega, A, B, nu
-    else:
-        k = 3 # omega, A, B
+    if 'student' in fam_str: k = 4 
+    else: k = 3 
     
     final_nll = loss_hist[-1] if loss_hist else float('nan')
     
@@ -405,7 +399,7 @@ def fit_single_edge(tree, edge, partner_col, fam_str, rotation, static_theta, st
     
     return edge, partner_col, result_dict, h_direct, h_indirect
 
-def fit_mixed_gas_vine(u_matrix, structure):
+def fit_mixed_gas_vine(u_matrix, structure, model_type):
     T, N = u_matrix.shape
     device = torch.device("cpu") 
     u_tensor = torch.tensor(u_matrix, dtype=torch.float64).to(device)
@@ -435,7 +429,6 @@ def fit_mixed_gas_vine(u_matrix, structure):
         
         tasks = []
         for edge in range(edges):
-            
             row = N - 1 - tree 
             col = edge
             var_1 = M[row, col]
@@ -454,12 +447,10 @@ def fit_mixed_gas_vine(u_matrix, structure):
             u_vec = torch.nan_to_num(u_vec, 0.5)
             v_vec = torch.nan_to_num(v_vec, 0.5)
 
-            # 1. Extract C++ PyVineCopulib info into picklable Python primitives
             if tree < len(fams):
                 pc = fams[tree][edge]
                 fam_str = str(pc.family)
                 rotation = int(pc.rotation)
-                # EXTRACT MLE PARAMETERS
                 params = pc.parameters.flatten()
                 static_theta = float(params[0]) if len(params) > 0 else None
                 static_nu = float(params[1]) if len(params) > 1 else None
@@ -468,12 +459,11 @@ def fit_mixed_gas_vine(u_matrix, structure):
                 rotation = 0
                 static_theta, static_nu = None, None
 
-            # 2. Convert to numpy so Joblib can use zero-copy memmap memory saving
             u_np = torch.nan_to_num(u_vec, 0.5).numpy()
             v_np = torch.nan_to_num(v_vec, 0.5).numpy()
             
-            # Pass static_theta and static_nu strictly into the task
-            tasks.append((tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, {'u': u_np, 'v': v_np}, T))
+            # Pass the model_type down to the worker thread
+            tasks.append((tree, edge, partner_col, fam_str, rotation, static_theta, static_nu, {'u': u_np, 'v': v_np}, T, model_type))
             
         results = Parallel(n_jobs=48, return_as="generator")(delayed(fit_single_edge)(*t) for t in tasks)
 
@@ -500,7 +490,6 @@ def print_gas_short_summary(fitted_gas):
         total_aic += info.get('aic', 0.0)
         total_bic += info.get('bic', 0.0)
         
-    # Convert Negative Log-Likelihood back to standard Log-Likelihood
     log_likelihood = -total_nll
     
     print(f"In-Sample Log-Likelihood: {log_likelihood:.2f}")
@@ -518,9 +507,7 @@ def theta_to_tau(family_str, theta_array):
     return theta
 
 def plot_dynamic_tau_paths(fitted_gas, dates, name, save_path):
-    """PhD-quality plot for dynamic Kendall's Tau paths."""
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.2)
-    
     top_edges = [k for k in fitted_gas.keys() if k.startswith("T0_E")][:3]
     if not top_edges: return
     
@@ -539,11 +526,8 @@ def plot_dynamic_tau_paths(fitted_gas, dates, name, save_path):
         ax = axes[i]
         ax.plot(dates, tau_path, color='#1f77b4', lw=1.5, label=f'{family} Copula')
         ax.axhline(0, color='black', linestyle='--', lw=1, alpha=0.7)
-        
         ax.set_ylabel(f"Kendall", fontsize=12)
         ax.set_title(f"Tree 1, Edge {i+1} Dynamics", fontsize=12, fontweight='bold')
-        
-        # Strict bounds for correlation visualization
         ax.set_ylim(-1.05, 1.05)
         ax.set_yticks([-1.0, -0.5, 0.0, 0.5, 1.0])
         ax.legend(loc='upper right', frameon=True, shadow=False)
@@ -556,15 +540,11 @@ def plot_dynamic_tau_paths(fitted_gas, dates, name, save_path):
     plt.close()
 
 def plot_gas_convergence(fitted_gas, name, save_path):
-    """PhD-quality convergence plot, safe for grayscale printing."""
     sns.set_theme(style="ticks", context="paper", font_scale=1.2)
-    
     top_edges = [k for k in fitted_gas.keys() if k.startswith("T0_E")][:4]
     if not top_edges: return
     
     plt.figure(figsize=(8, 5))
-    
-    # Use distinct line styles for grayscale printing
     line_styles = ['-', '--', '-.', ':']
     colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
     
@@ -572,24 +552,20 @@ def plot_gas_convergence(fitted_gas, name, save_path):
         loss_hist = fitted_gas[edge_key]['loss_history']
         fam = fitted_gas[edge_key]["family"].capitalize()
         if loss_hist:
-            # Shift the loss so it visualizes better if the scale is massive
             plt.plot(loss_hist, lw=2, linestyle=line_styles[idx % 4], color=colors[idx % 4],
                      label=f'{edge_key} ({fam})')
             
     plt.title(f"Optimization Convergence: {name}", fontsize=14, fontweight='bold')
     plt.xlabel("Optimization Epoch", fontsize=12)
     plt.ylabel("Negative Log-Likelihood", fontsize=12)
-    
     plt.grid(True, linestyle=':', alpha=0.6)
     plt.legend(frameon=True, loc='best')
     sns.despine()
-    
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
 
 def save_vine_summary_csv(fitted_gas, save_path):
-    """Exports the GAS vine summary statistics to a CSV for easy LaTeX/Excel import."""
     rows = []
     total_nll, total_aic, total_bic = 0.0, 0.0, 0.0
     
@@ -616,11 +592,8 @@ def save_vine_summary_csv(fitted_gas, save_path):
         total_bic += info['bic']
         
     df = pd.DataFrame(rows, columns=['Edge', 'Family', 'Rotation', 'Omega', 'A', 'B', 'Nu', 'NLL', 'AIC', 'BIC'])
-    
-    # Append a final row for the Totals
     totals_row = pd.DataFrame([['TOTAL', '-', '-', '-', '-', '-', '-', total_nll, total_aic, total_bic]], columns=df.columns)
     df = pd.concat([df, totals_row], ignore_index=True)
-    
     df.to_csv(save_path, index=False)
 
 if __name__ == "__main__":
@@ -648,7 +621,9 @@ if __name__ == "__main__":
     u_nsde = u_nsde.loc[global_valid_dates]
     print(f"Evaluation Period: {global_valid_dates[0].date()} to {global_valid_dates[-1].date()}")
 
+    # Capture the argument passed in the terminal
     model_choice = sys.argv[1].upper() if len(sys.argv) > 1 else "ALL"
+    
     if model_choice == "HAR":
         factor_sets = {"HAR-GARCH-EVT": u_har}
     elif model_choice == "NSDE":
@@ -666,7 +641,8 @@ if __name__ == "__main__":
         static_json_path = os.path.join(static_out_dir, f"joint_vine_spot_{factor_name.lower().replace('-', '_')}_model.json")
         static_model = pv.Vinecop.from_file(static_json_path)
 
-        gas_fitted_models = fit_mixed_gas_vine(np_data, static_model)
+        # Pass the factor_name down to determine optimizer behavior
+        gas_fitted_models = fit_mixed_gas_vine(np_data, static_model, factor_name)
         print_gas_short_summary(gas_fitted_models)
 
         save_prefix = f"gas_vine_spot_{factor_name.lower().replace('-', '_')}"

@@ -48,26 +48,19 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
 
     df_res = pd.DataFrame(results)
     
-    # --- DYNAMIC ECONOMIC INSIGHTS ---
-    # Find the tree where Spot_Spot drops to 1 or 0
-    spot_spot_death = df_res[df_res['Spot_Spot'] <= 1]['Tree'].min()
-    
-    # Find the peak of the leverage effect
-    max_sv_idx = df_res['Spot_Vol'].idxmax()
-    max_sv_tree = df_res.loc[max_sv_idx, 'Tree']
-    max_sv_val = df_res.loc[max_sv_idx, 'Spot_Vol']
-    
-    # Find what it decays to 5 trees later
-    decay_tree = min(max_sv_tree + 5, max_tree)
-    val_at_decay = df_res[df_res['Tree'] == decay_tree]['Spot_Vol'].values[0]
-    save_path = os.path.join(graph_dir, f"{name}_vine_truncation_analysis.png")
+    # --- STRICT CONTAGION EXHAUSTION TRUNCATION ---
+    # Enforcing the 12/14 parsimony rule from the thesis methodology
+    if "HAR" in name.upper():
+        truncation_tree = 12
+    else:
+        truncation_tree = 14
+
+    save_path = os.path.join(graph_dir, f"Decay_{name}.png")
 
     print(f"\n" + "="*50)
     print(f"--- DYNAMIC ECONOMIC INSIGHTS: {name} ---")
     print("="*50)
-    print(f"Tree {spot_spot_death}: Spot_Spot essentially dies here (<= 1 edge left). Pure contagion is finished.")
-    print(f"Tree {max_sv_tree}: Spot_Vol hits its absolute maximum at {max_sv_val} edges. This is the peak of the macro leverage effect.")
-    print(f"Tree {max_sv_tree + 1}+: The Spot_Vol edges begin a permanent decay, dropping to {val_at_decay} edges by Tree {decay_tree}.")
+    print(f"Enforcing strict Contagion Exhaustion Truncation at Tree {truncation_tree}.")
     print("="*50)
     
     # --- PLOT DUAL-AXIS GRAPH ---
@@ -87,8 +80,8 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
     ax2.plot(df_res['Tree'], df_res['IS_LL'], color='darkgreen', marker='o', linewidth=2.5, markersize=5, label='In-Sample Log-Likelihood')
     ax2.set_ylabel("In-Sample Log-Likelihood", color='darkgreen', fontsize=14)
     
-    # Highlight the recommended peak
-    ax1.axvline(x=max_sv_tree, color='black', linestyle='--', linewidth=2.5, label=f'Macro Peak (Tree {max_sv_tree})')
+    # Highlight the strict Contagion Exhaustion truncation
+    ax1.axvline(x=truncation_tree, color='black', linestyle='--', linewidth=2.5, label=f'Contagion Exhaustion (Tree {truncation_tree})')
     
     lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
@@ -98,12 +91,12 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
     plt.tight_layout()
     plt.savefig(save_path, dpi=300)
     
-    # Show the plot to the user (Code will pause here until they close the window)
-    print("\n[!] Please review the popup graph to make your decision...")
+    # Show the plot to the user
+    print("\n[!] Please review the popup graph. The line has been placed according to the thesis methodology.")
     plt.show() 
     
     # --- USER INPUT ---
-    chosen_k = int(input(f"\nEnter chosen Truncation Level for {name} based on the plot and insights (e.g., {max_sv_tree}): "))
+    chosen_k = int(input(f"\nPress Enter to accept Truncation Level [{truncation_tree}] or type a manual override: ") or truncation_tree)
     return chosen_k
 
 if __name__ == "__main__":
