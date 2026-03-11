@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,7 +16,6 @@ from joblib import Parallel, delayed
 import multiprocessing
 import json
 import sys
-import os
 import random
 
 torch.set_default_dtype(torch.float64)
@@ -420,7 +420,7 @@ def fit_mixed_gas_vine(u_matrix, structure, model_type):
         h_storage[(i, -1)] = u_tensor[:, i]
 
     fitted_models = {}
-    active_cores = 48
+    active_cores = min(64, os.cpu_count() // 2)
     print(f"Parallelizing Vine Fitting across {active_cores} CPU cores...")
 
     for tree in range(N - 1):
