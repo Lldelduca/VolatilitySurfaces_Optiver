@@ -6,8 +6,7 @@ import seaborn as sns
 import os
 import random
 
-def analyze_tree_subsets(model, u_train, var_names, name):
-    """Analyzes the topological density and prompts the user for the cutoff."""
+def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir):
     d = len(var_names)
     is_spot = {i: ('PC' not in var_names[i]) for i in range(d)}
     
@@ -18,9 +17,13 @@ def analyze_tree_subsets(model, u_train, var_names, name):
         
     results = []
     max_tree = d - 1 
-    algorithmic_cutoff = None
     
     print(f"\nAnalyzing Economic Subsets and In-Sample LL for {name} ({max_tree} trees)...")
+    
+    # Track the algorithmic cutoff (First time Spot-Spot density <= 5%)
+    algorithmic_cutoff = None
+    
+    # 1. Print Header
     print(f"\n{'Tree':<6} | {'Spot-Spot':<12} | {'Density':<10} | {'Spot-Vol':<10} | {'Vol-Vol':<10}")
     print("-" * 60)
     
@@ -41,6 +44,7 @@ def analyze_tree_subsets(model, u_train, var_names, name):
         total_edges = spot_spot + spot_vol + vol_vol
         spot_density = (spot_spot / total_edges) if total_edges > 0 else 0.0
         
+        # Algorithmic Detection: 5% Topological Density Rule
         if algorithmic_cutoff is None and spot_density <= 0.05:
             algorithmic_cutoff = lvl
                 
@@ -55,84 +59,66 @@ def analyze_tree_subsets(model, u_train, var_names, name):
             'Pct_Involving_Spot': pct_involving_spot, 'IS_LL': is_ll
         })
         
+        # 2. Print Exact Numbers (only up to tree 30 to avoid terminal spam)
         if lvl <= 30:
             marker = "<-- 5% CUTOFF MET" if lvl == algorithmic_cutoff else ""
             print(f"{lvl:<6} | {spot_spot:<12} | {spot_density*100:>5.1f}%    | {spot_vol:<10} | {vol_vol:<10} {marker}")
 
+    df_res = pd.DataFrame(results)
+    
+    # Fallback if it never hits 5% (extremely unlikely)
     if algorithmic_cutoff is None:
         algorithmic_cutoff = max_tree
     
     print(f"\n" + "="*50)
+    print(f"--- DYNAMIC ECONOMIC INSIGHTS: {name} ---")
+    print("="*50)
     print(f"The algorithm detected the 5% density terminal plateau at Tree {algorithmic_cutoff}.")
     
-    user_input = input(f"Press Enter to accept Algorithm Truncation [{algorithmic_cutoff}] or type a manual override: ")
-    chosen_k = int(user_input) if user_input.strip() else algorithmic_cutoff
-    
-    return pd.DataFrame(results), chosen_k, d
-
-def plot_combined_decay(df_har, k_har, df_nsde, k_nsde, d, save_path):
-    """Generates a single, side-by-side 1x2 figure with a unified global legend."""
+    # --- PLOT GRAPH WITHOUT THE LINE ---
     sns.set_theme(style="white", context="paper", font_scale=1.2)
+    fig, ax1 = plt.subplots(figsize=(14, 7))
     
-    # 1x2 Subplots sharing the primary Y-axis (Number of Edges)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6.5), sharey=True)
-    
-    # --- PLOT HAR-GARCH ---
-    b1 = ax1.bar(df_har['Tree'], df_har['Spot_Spot'], label='Spot-Spot (Contagion)', color='#3f51b5', edgecolor='white', linewidth=0.5)
-    b2 = ax1.bar(df_har['Tree'], df_har['Spot_Vol'], bottom=df_har['Spot_Spot'], label='Spot-Vol (Leverage)', color='#c62828', edgecolor='white', linewidth=0.5)
-    b3 = ax1.bar(df_har['Tree'], df_har['Vol_Vol'], bottom=df_har['Spot_Spot']+df_har['Spot_Vol'], label='Vol-Vol (Spillover)', color='#bdbdbd', alpha=0.7, edgecolor='white', linewidth=0.5)
+    ax1.bar(df_res['Tree'], df_res['Spot_Spot'], label='Spot-Spot (Contagion)', color='#3f51b5', edgecolor='white', linewidth=0.5)
+    ax1.bar(df_res['Tree'], df_res['Spot_Vol'], bottom=df_res['Spot_Spot'], label='Spot-Vol (Leverage)', color='#c62828', edgecolor='white', linewidth=0.5)
+    ax1.bar(df_res['Tree'], df_res['Vol_Vol'], bottom=df_res['Spot_Spot']+df_res['Spot_Vol'], label='Vol-Vol (Conditional Noise)', color='#bdbdbd', alpha=0.7, edgecolor='white', linewidth=0.5)
     
     ax1.set_xlabel("Vine Tree Level", fontsize=14)
     ax1.set_ylabel("Number of Edges (Subset Composition)", fontsize=14)
-    ax1.set_title("Panel A: HAR-GARCH Copula", fontsize=15, fontweight='bold')
-    ax1.set_xticks(np.arange(1, d, 4))
+    ax1.set_xticks(np.arange(1, d, 2))
     ax1.set_xlim(0, d)
     
-    ax1_ll = ax1.twinx()
-    l1, = ax1_ll.plot(df_har['Tree'], df_har['IS_LL'], color='darkgreen', marker='o', linewidth=2.5, markersize=4, label='In-Sample Log-Likelihood')
-    v1 = ax1.axvline(x=k_har, color='black', linestyle='--', linewidth=2.5, label=r'5% Density Truncation Limit')
+    ax2 = ax1.twinx()
+    ax2.plot(df_res['Tree'], df_res['IS_LL'], color='darkgreen', marker='o', linewidth=2.5, markersize=5, label='In-Sample Log-Likelihood')
+    ax2.set_ylabel("In-Sample Log-Likelihood", color='darkgreen', fontsize=14)
     
-    # --- PLOT NSDE ---
-    ax2.bar(df_nsde['Tree'], df_nsde['Spot_Spot'], color='#3f51b5', edgecolor='white', linewidth=0.5)
-    ax2.bar(df_nsde['Tree'], df_nsde['Spot_Vol'], bottom=df_nsde['Spot_Spot'], color='#c62828', edgecolor='white', linewidth=0.5)
-    ax2.bar(df_nsde['Tree'], df_nsde['Vol_Vol'], bottom=df_nsde['Spot_Spot']+df_nsde['Spot_Vol'], color='#bdbdbd', alpha=0.7, edgecolor='white', linewidth=0.5)
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='center right', frameon=True, shadow=True)
     
-    ax2.set_xlabel("Vine Tree Level", fontsize=14)
-    ax2.set_title("Panel B: Neural SDE Copula", fontsize=15, fontweight='bold')
-    ax2.set_xticks(np.arange(1, d, 4))
-    ax2.set_xlim(0, d)
+    plt.title(f"Structural Validation & Economic Decay: {name}", fontsize=16, fontweight='bold')
+    plt.tight_layout()
     
-    ax2_ll = ax2.twinx()
-    ax2_ll.plot(df_nsde['Tree'], df_nsde['IS_LL'], color='darkgreen', marker='o', linewidth=2.5, markersize=4)
-    ax2.axvline(x=k_nsde, color='black', linestyle='--', linewidth=2.5)
-
-    # --- SYNCHRONIZE SECONDARY Y-AXIS (LOG-LIKELIHOOD) ---
-    min_ll = min(df_har['IS_LL'].min(), df_nsde['IS_LL'].min())
-    max_ll = max(df_har['IS_LL'].max(), df_nsde['IS_LL'].max())
-    pad = (max_ll - min_ll) * 0.05
+    # 3. Show the plot interactively to the user
+    print("\n[!] Please review the popup graph.")
+    plt.show() 
     
-    ax1_ll.set_ylim(min_ll - pad, max_ll + pad)
-    ax2_ll.set_ylim(min_ll - pad, max_ll + pad)
+    # 4. User Input 
+    user_input = input(f"\nPress Enter to accept Algorithm Truncation [{algorithmic_cutoff}] or type a manual override: ")
+    chosen_k = int(user_input) if user_input.strip() else algorithmic_cutoff
     
-    # Hide the ticks and labels on the first graph's right axis to avoid middle clutter
-    ax1_ll.tick_params(right=False, labelright=False)
+    # 5. Draw the final line and save the PNG
+    ax1.axvline(x=chosen_k, color='black', linestyle='--', linewidth=2.5, label=rf'Contagion Density $\leq$ 5% (Tree {chosen_k})')
     
-    # Only label the far-right axis of the entire figure
-    ax2_ll.set_ylabel("In-Sample Log-Likelihood", color='darkgreen', fontsize=14)
-
-    # --- GLOBAL UNIFIED LEGEND ---
-    handles = [b1, b2, b3, l1, v1]
-    labels = [h.get_label() for h in handles]
+    # Refresh legend to include the new black line
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='center right', frameon=True, shadow=True)
     
-    # Place legend above the entire figure
-    legend = fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 1.08), ncol=5, frameon=True, fontsize=12, shadow=True)
+    save_path = os.path.join(graph_dir, f"Decay_{name}.png")
+    fig.savefig(save_path, dpi=300)
+    print(f"Saved final graph with truncation line at {chosen_k} to {save_path}")
     
-    # Manually adjust subplots to make room for the legend and push graphs close together
-    plt.subplots_adjust(top=0.90, bottom=0.1, left=0.05, right=0.95, wspace=0.05)
-    
-    # Pass the legend as an extra artist so bbox_inches='tight' doesn't crop it
-    fig.savefig(save_path, dpi=300, bbox_inches='tight', bbox_extra_artists=(legend,))
-    print(f"\n[+] Master combined graph saved successfully to: {save_path}")
+    return chosen_k
 
 if __name__ == "__main__":
     seed = 42
@@ -156,44 +142,30 @@ if __name__ == "__main__":
     global_valid_dates = u_spot.index.intersection(u_har.index).intersection(u_nsde.index)
     u_spot, u_har, u_nsde = u_spot.loc[global_valid_dates], u_har.loc[global_valid_dates], u_nsde.loc[global_valid_dates]
 
-    # --- 1. Analyze HAR-GARCH ---
-    print(f"\n{'='*50}\n--- 1/2: Exploring Joint Copula: Spot + HAR-GARCH ---\n{'='*50}")
-    combined_u_har = pd.concat([u_spot, u_har], axis=1)
-    var_names_har = combined_u_har.columns.tolist()
-    d_har = combined_u_har.shape[1]
-    
-    controls_har = pv.FitControlsVinecop(
-        family_set=[pv.BicopFamily.indep, pv.BicopFamily.gaussian, pv.BicopFamily.student, 
-                    pv.BicopFamily.frank, pv.BicopFamily.clayton, pv.BicopFamily.gumbel],
-        selection_criterion="aic", tree_criterion="tau", allow_rotations=True,
-        num_threads=os.cpu_count()-1, threshold=0.05, trunc_lvl=d_har-1
-    )
-    model_har = pv.Vinecop(d=d_har)
-    model_har.select(combined_u_har.to_numpy(), controls=controls_har)
-    df_har, k_har, d = analyze_tree_subsets(model_har, combined_u_har.to_numpy(), var_names_har, "HAR-GARCH-EVT")
+    factor_sets = {"HAR-GARCH-EVT": u_har, "NSDE": u_nsde}
+    optimal_ranks = {}
 
-    # --- 2. Analyze NSDE ---
-    print(f"\n{'='*50}\n--- 2/2: Exploring Joint Copula: Spot + NSDE ---\n{'='*50}")
-    combined_u_nsde = pd.concat([u_spot, u_nsde], axis=1)
-    var_names_nsde = combined_u_nsde.columns.tolist()
-    
-    controls_nsde = pv.FitControlsVinecop(
-        family_set=[pv.BicopFamily.indep, pv.BicopFamily.gaussian, pv.BicopFamily.student, 
-                    pv.BicopFamily.frank, pv.BicopFamily.clayton, pv.BicopFamily.gumbel],
-        selection_criterion="aic", tree_criterion="tau", allow_rotations=True,
-        num_threads=os.cpu_count()-1, threshold=0.05, trunc_lvl=d_har-1
-    )
-    model_nsde = pv.Vinecop(d=d_har)
-    model_nsde.select(combined_u_nsde.to_numpy(), controls=controls_nsde)
-    df_nsde, k_nsde, _ = analyze_tree_subsets(model_nsde, combined_u_nsde.to_numpy(), var_names_nsde, "NSDE")
+    for factor_name, u_factors in factor_sets.items():
+        print(f"\n{'='*50}\n--- Exploring Joint Copula: Spot + {factor_name} ---\n{'='*50}")
+        combined_u_train = pd.concat([u_spot, u_factors], axis=1)
+        np_data_train = combined_u_train.to_numpy()
+        var_names = combined_u_train.columns.tolist()
+        d = np_data_train.shape[1]
 
-    # --- 3. Plot Combined Figure ---
-    print("\nGenerating final Master Figure...")
-    save_path = os.path.join(graph_dir, "Decay_Combined_Master.png")
-    plot_combined_decay(df_har, k_har, df_nsde, k_nsde, d, save_path)
+        controls = pv.FitControlsVinecop(
+            family_set=[pv.BicopFamily.indep, pv.BicopFamily.gaussian, pv.BicopFamily.student, 
+                        pv.BicopFamily.frank, pv.BicopFamily.clayton, pv.BicopFamily.gumbel],
+            selection_criterion="aic", tree_criterion="tau", allow_rotations=True,
+            num_threads=os.cpu_count()-1, threshold=0.05, trunc_lvl=d-1
+        )
+        exploratory_model = pv.Vinecop(d=d)
+        exploratory_model.select(np_data_train, controls=controls)
+        
+        chosen_k = analyze_tree_subsets_interactive(exploratory_model, np_data_train, var_names, factor_name, graph_dir)
+        optimal_ranks[factor_name] = chosen_k
 
     print("\n" + "="*50)
     print("PHASE 1 COMPLETE. UPDATE YOUR config/settings.py WITH:")
-    print(f"K_HAR_GARCH = {k_har}")
-    print(f"K_NSDE = {k_nsde}")
+    print(f"K_HAR_GARCH = {optimal_ranks['HAR-GARCH-EVT']}")
+    print(f"K_NSDE = {optimal_ranks['NSDE']}")
     print("="*50)
