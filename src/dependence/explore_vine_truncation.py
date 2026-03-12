@@ -20,6 +20,13 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
     
     print(f"\nAnalyzing Economic Subsets and In-Sample LL for {name} ({max_tree} trees)...")
     
+    # Track the algorithmic cutoff (First time Spot-Spot density <= 5%)
+    algorithmic_cutoff = None
+    
+    # 1. Print Header
+    print(f"\n{'Tree':<6} | {'Spot-Spot':<12} | {'Density':<10} | {'Spot-Vol':<10} | {'Vol-Vol':<10}")
+    print("-" * 60)
+    
     for tree_idx in range(max_tree): 
         lvl = tree_idx + 1
         spot_spot, spot_vol, vol_vol = 0, 0, 0
@@ -35,6 +42,12 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
             else: spot_vol += 1
                 
         total_edges = spot_spot + spot_vol + vol_vol
+        spot_density = (spot_spot / total_edges) if total_edges > 0 else 0.0
+        
+        # Algorithmic Detection: 5% Topological Density Rule
+        if algorithmic_cutoff is None and spot_density <= 0.05:
+            algorithmic_cutoff = lvl
+                
         pct_involving_spot = ((spot_spot + spot_vol) / total_edges) * 100 if total_edges > 0 else 0
         
         trunc_model = pv.Vinecop.from_json(model_json)
@@ -45,25 +58,24 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
             'Tree': lvl, 'Spot_Spot': spot_spot, 'Spot_Vol': spot_vol, 'Vol_Vol': vol_vol,
             'Pct_Involving_Spot': pct_involving_spot, 'IS_LL': is_ll
         })
+        
+        # 2. Print Exact Numbers (only up to tree 30 to avoid terminal spam)
+        if lvl <= 30:
+            marker = "<-- 5% CUTOFF MET" if lvl == algorithmic_cutoff else ""
+            print(f"{lvl:<6} | {spot_spot:<12} | {spot_density*100:>5.1f}%    | {spot_vol:<10} | {vol_vol:<10} {marker}")
 
     df_res = pd.DataFrame(results)
     
-    # --- STRICT CONTAGION EXHAUSTION TRUNCATION ---
-    # Enforcing the 12/14 parsimony rule from the thesis methodology
-    if "HAR" in name.upper():
-        truncation_tree = 12
-    else:
-        truncation_tree = 14
-
-    save_path = os.path.join(graph_dir, f"Decay_{name}.png")
-
+    # Fallback if it never hits 5% (extremely unlikely)
+    if algorithmic_cutoff is None:
+        algorithmic_cutoff = max_tree
+    
     print(f"\n" + "="*50)
     print(f"--- DYNAMIC ECONOMIC INSIGHTS: {name} ---")
     print("="*50)
-    print(f"Enforcing strict Contagion Exhaustion Truncation at Tree {truncation_tree}.")
-    print("="*50)
+    print(f"The algorithm detected the 5% density terminal plateau at Tree {algorithmic_cutoff}.")
     
-    # --- PLOT DUAL-AXIS GRAPH ---
+    # --- PLOT GRAPH WITHOUT THE LINE ---
     sns.set_theme(style="white", context="paper", font_scale=1.2)
     fig, ax1 = plt.subplots(figsize=(14, 7))
     
@@ -80,23 +92,32 @@ def analyze_tree_subsets_interactive(model, u_train, var_names, name, graph_dir)
     ax2.plot(df_res['Tree'], df_res['IS_LL'], color='darkgreen', marker='o', linewidth=2.5, markersize=5, label='In-Sample Log-Likelihood')
     ax2.set_ylabel("In-Sample Log-Likelihood", color='darkgreen', fontsize=14)
     
-    # Highlight the strict Contagion Exhaustion truncation
-    ax1.axvline(x=truncation_tree, color='black', linestyle='--', linewidth=2.5, label=f'Contagion Exhaustion (Tree {truncation_tree})')
-    
     lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
     ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='center right', frameon=True, shadow=True)
     
     plt.title(f"Structural Validation & Economic Decay: {name}", fontsize=16, fontweight='bold')
     plt.tight_layout()
-    plt.savefig(save_path, dpi=300)
     
-    # Show the plot to the user
-    print("\n[!] Please review the popup graph. The line has been placed according to the thesis methodology.")
+    # 3. Show the plot interactively to the user
+    print("\n[!] Please review the popup graph.")
     plt.show() 
     
-    # --- USER INPUT ---
-    chosen_k = int(input(f"\nPress Enter to accept Truncation Level [{truncation_tree}] or type a manual override: ") or truncation_tree)
+    # 4. User Input 
+    user_input = input(f"\nPress Enter to accept Algorithm Truncation [{algorithmic_cutoff}] or type a manual override: ")
+    chosen_k = int(user_input) if user_input.strip() else algorithmic_cutoff
+    
+    # 5. Draw the final line and save the PNG
+    ax1.axvline(x=chosen_k, color='black', linestyle='--', linewidth=2.5, label=rf'Contagion Density $\leq$ 5% (Tree {chosen_k})')
+    
+    # Refresh legend to include the new black line
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc='center right', frameon=True, shadow=True)
+    
+    save_path = os.path.join(graph_dir, f"Decay_{name}.png")
+    fig.savefig(save_path, dpi=300)
+    print(f"Saved final graph with truncation line at {chosen_k} to {save_path}")
+    
     return chosen_k
 
 if __name__ == "__main__":
