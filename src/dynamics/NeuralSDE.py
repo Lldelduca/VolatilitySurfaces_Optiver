@@ -1,482 +1,528 @@
+import json
 import os
-import subprocess
-import sys
+import warnings
+import random
 
-# --- ENVIRONMENT SETUP ---
-# Quietly install required packages for background execution
-os.system('pip install -q optuna torch-ema')
+os.environ['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+os.environ['PYTHONHASHSEED'] = '42'
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from scipy.stats import genpareto, gaussian_kde, kstest
+from scipy.stats import t as scipy_t
+from scipy.special import gammaln
+from sklearn.model_selection import TimeSeriesSplit
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
-import matplotlib.pyplot as plt
-import pandas as pd
-import copy
+from torch.amp import autocast, GradScaler
+from torch_ema import ExponentialMovingAverage
+
 import optuna
-import json
-import pickle
-import warnings
-import shutil
-from sklearn.model_selection import TimeSeriesSplit
-from scipy.stats import genpareto, gaussian_kde, kstest
+from tqdm.auto import tqdm
 
-# Robust tqdm for background logs
-try:
-    from tqdm.auto import tqdm
-except ImportError:
-    from tqdm import tqdm
+from src.dynamics.EVT import EVT
 
-# Force non-interactive backend for Kaggle "Save & Run All" stability
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+seed_everything(42)
+
 plt.switch_backend('agg')
 plt.rcParams['mathtext.fontset'] = 'cm'
 np.seterr(all='ignore')
 warnings.filterwarnings("ignore")
-
-# --- SILENCE OPTUNA SPAM ---
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# --- HARDWARE SETUP ---
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"--- HARDWARE CHECK ---")
-if device == 'cuda':
-    print(f"✅ GPU Detected: {torch.cuda.get_device_name(0)}\n")
-else:
-    print("⚠️ Using CPU (GPU recommended for faster training)\n")
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Initialized Neural SDE with device: {device}")
 
 GLOBAL_N_LAGS = 40
 
-# %% --- EXTREME VALUE THEORY CLASS ---
 
-class EVT:
-    """Three-region semi-parametric EVT (GPD for tails, KDE for body)"""
-    def __init__(self):
-        self.u_lower = None
-        self.u_upper = None
-        self.params_lower = None
-        self.params_upper = None
-        self.body_kde = None
-        self.eta_l = None
-        self.eta_u = None
-        self.body_min_cdf = 0.0
-        self.body_max_cdf = 1.0
-        self._is_fitted = False
-
-    def fit(self, z, lower_quantile=0.10, upper_quantile=0.10):
-        self.eta_l = lower_quantile
-        self.eta_u = upper_quantile
-        sorted_z = np.sort(z)
-        n = len(z)
-        idx_lower = int(self.eta_l * n)
-        idx_upper = int((1 - self.eta_u) * n)
-        if idx_lower >= idx_upper:
-            raise ValueError("Tail thresholds overlap or dataset too small.")
-        self.u_lower = sorted_z[idx_lower]
-        self.u_upper = sorted_z[idx_upper]
-
-        # Lower Tail (GPD)
-        lower_data = sorted_z[sorted_z < self.u_lower]
-        if len(lower_data) >= 10:
-            excess_lower = self.u_lower - lower_data
-            self.params_lower = genpareto.fit(excess_lower, floc=0)
-        else:
-            self.params_lower = None
-
-        # Upper Tail (GPD)
-        upper_data = sorted_z[sorted_z > self.u_upper]
-        if len(upper_data) >= 10:
-            excess_upper = upper_data - self.u_upper
-            self.params_upper = genpareto.fit(excess_upper, floc=0)
-        else:
-            self.params_upper = None
-
-        # Body (Gaussian KDE)
-        mask_body = (sorted_z >= self.u_lower) & (sorted_z <= self.u_upper)
-        body_data = sorted_z[mask_body]
-        if len(body_data) > 2:
-            self.body_kde = gaussian_kde(body_data)
-            self.body_min_cdf = self.body_kde.integrate_box_1d(-np.inf, self.u_lower)
-            self.body_max_cdf = self.body_kde.integrate_box_1d(-np.inf, self.u_upper)
-        else:
-            self.body_kde = None
-
-        self._is_fitted = True
-        return self
-
-    def transform(self, z):
-        if not self._is_fitted:
-            raise RuntimeError("Model must be fitted before transform.")
-        u = np.zeros_like(z, dtype=float)
-        mask_l = z < self.u_lower
-        if np.any(mask_l):
-            if self.params_lower:
-                xi, _, sigma = self.params_lower
-                excess = self.u_lower - z[mask_l]
-                cdf_gpd = genpareto.cdf(excess, xi, 0, sigma)
-                u[mask_l] = self.eta_l * (1 - cdf_gpd)
-            else:
-                u[mask_l] = self.eta_l * 0.5
-        mask_u = z > self.u_upper
-        if np.any(mask_u):
-            if self.params_upper:
-                xi, _, sigma = self.params_upper
-                excess = z[mask_u] - self.u_upper
-                cdf_gpd = genpareto.cdf(excess, xi, 0, sigma)
-                u[mask_u] = (1 - self.eta_u) + self.eta_u * cdf_gpd
-            else:
-                u[mask_u] = 1.0 - (self.eta_u * 0.5)
-        mask_b = (~mask_l) & (~mask_u)
-        if np.any(mask_b) and self.body_kde:
-            raw_cdf = np.array([self.body_kde.integrate_box_1d(-np.inf, x) for x in z[mask_b]])
-            target_range = (1 - self.eta_u) - self.eta_l
-            raw_range = self.body_max_cdf - self.body_min_cdf
-            if raw_range > 1e-9:
-                u[mask_b] = self.eta_l + (raw_cdf - self.body_min_cdf) * (target_range / raw_range)
-            else:
-                u[mask_b] = 0.5
-        elif np.any(mask_b):
-            u[mask_b] = 0.5
-        return np.clip(u, 1e-6, 1-1e-6)
-
-# %% --- CORE MODEL CLASSES ---
+# =============================================================================
+# --- Architecture ---
+# =============================================================================
 
 class GRU_Encoder(nn.Module):
     def __init__(self, n_in, n_hidden, n_layers, dropout_rate=0.0):
         super().__init__()
         gru_drop = dropout_rate if n_layers > 1 else 0.0
         self.gru = nn.GRU(n_in, n_hidden, n_layers, batch_first=True, dropout=gru_drop)
+        self.out_dim = n_hidden * n_layers + n_hidden
 
     def forward(self, x):
         self.gru.flatten_parameters()
-        _, h = self.gru(x)
-        return h.transpose(0, 1).flatten(start_dim=1)
+        seq_out, h = self.gru(x)
+        h_flat = h.transpose(0, 1).flatten(start_dim=1)
+        pooled = seq_out.mean(dim=1)
+        return torch.cat([h_flat, pooled], dim=1)
+
 
 class DriftNet(nn.Module):
     def __init__(self, n_in, n_hidden, n_layers, n_out, dropout_rate=0.0):
         super().__init__()
         self.encoder = GRU_Encoder(n_in, n_hidden, n_layers, dropout_rate)
         self.dropout = nn.Dropout(dropout_rate)
-        self.head = nn.Linear(n_hidden * n_layers, n_out)
+        self.head = nn.Linear(self.encoder.out_dim, n_out)
+
     def forward(self, x):
-        features = self.encoder(x)
-        out = self.head(self.dropout(features))
-        return torch.clamp(out, min=-20.0, max=20.0)
+        return torch.clamp(self.head(self.dropout(self.encoder(x))), -20.0, 20.0)
+
 
 class DiffusionNet(nn.Module):
     def __init__(self, n_in, n_hidden, n_layers, n_out, dropout_rate=0.0):
         super().__init__()
         self.encoder = GRU_Encoder(n_in, n_hidden, n_layers, dropout_rate)
         self.dropout = nn.Dropout(dropout_rate)
-        self.head = nn.Linear(n_hidden * n_layers, n_out)
+        self.head = nn.Linear(self.encoder.out_dim, n_out)
         self.softplus = nn.Softplus()
+
     def forward(self, x):
-        features = self.encoder(x)
-        out = self.head(self.dropout(features))
-        out = torch.clamp(out, min=-20.0, max=20.0)
-        return self.softplus(out) + 1e-4
+        return self.softplus(torch.clamp(self.head(self.dropout(self.encoder(x))), -20.0, 20.0)) + 1e-4
+
 
 class NeuralSDE(nn.Module):
     def __init__(self, params, device=device):
         super().__init__()
-        self.params, self.device = params, device
-        self.n_lags = params.get('n_lags', 10)
+        self.params = params
+        self.device = device
+        self.n_lags = params.get('n_lags', GLOBAL_N_LAGS)
         self.alpha_pit = params.get('alpha_pit', 100.0)
-        n_features, dropout_rate = params.get('n_features', 1), params.get('dropout', 0.0)
+        n_features = params.get('n_features', 1)
+        dropout_rate = params.get('dropout', 0.0)
+
         self.pi_drift = DriftNet(n_features, params['hidden_size'], params['n_layers'], n_features, dropout_rate).to(device)
         self.pi_diff = DiffusionNet(n_features, params['hidden_size'], params['n_layers'], n_features, dropout_rate).to(device)
-        self.optimizer = optim.AdamW(list(self.pi_drift.parameters()) + list(self.pi_diff.parameters()), lr=params.get('lr', 1e-3), weight_decay=params.get('weight_decay', 1e-4))
+        self.log_nu = nn.Parameter(torch.tensor(np.log(4.0), dtype=torch.float32, device=device))
+
+        all_params = list(self.pi_drift.parameters()) + list(self.pi_diff.parameters()) + [self.log_nu]
+
+        self.optimizer = optim.AdamW(all_params, lr=params.get('lr', 1e-3), weight_decay=params.get('weight_decay', 1e-4))
         self.scheduler = optim.lr_scheduler.StepLR(self.optimizer, step_size=1000, gamma=0.9)
-        self.register_buffer('sqrt_2pi', torch.tensor(2.50662827).to(device))
+        self.ema = ExponentialMovingAverage(all_params, decay=0.999)
+        self.scaler = GradScaler()
+        self.sqrt_2pi = torch.tensor(2.50662827, device=device)
         self.loss_history = {'total': [], 'nll': [], 'penalty': []}
 
-    def register_buffer(self, name, tensor):
-        setattr(self, name, tensor)
+    @property
+    def nu(self):
+        return torch.clamp(torch.exp(self.log_nu), min=2.1, max=30.0)
+
+    def _studentt_cdf(self, x, loc, scale):
+        class _CDF(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, z, nu_val):
+                z_np = z.detach().cpu().float().numpy()
+                cdf_np = scipy_t.cdf(z_np, df=nu_val).astype(np.float32)
+                pdf_np = scipy_t.pdf(z_np, df=nu_val).astype(np.float32)
+                ctx.save_for_backward(torch.from_numpy(pdf_np).to(z.device))
+                return torch.from_numpy(cdf_np).to(z.device)
+
+            @staticmethod
+            def backward(ctx, grad_out):
+                (pdf,) = ctx.saved_tensors
+                return grad_out * pdf, None
+
+        z = (x - loc) / scale
+        cdf = _CDF.apply(z, float(self.nu.item()))
+        return torch.clamp(cdf, 1e-6, 1 - 1e-6)
 
     def get_pit(self, nu, sigma, dX, dT):
-        t = torch.clamp((dX - nu * dT) / (sigma * torch.sqrt(dT)), min=-20.0, max=20.0)
-        return 0.5 + t * (t**2 + 6) / (2 * (t**2 + 4)**1.5)
+        return self._studentt_cdf(dX, loc=nu * dT, scale=sigma * torch.sqrt(dT))
 
     def density_penalty(self, pit_values):
         batch_size, n_features = pit_values.shape
-        u_grid = torch.linspace(0, 1, 100, device=self.device).view(1, -1)
-        du, error = 1.0 / 100, 0.0
+        n_grid = 100
+        u_grid = torch.linspace(0, 1, n_grid, device=self.device)
+        du = 1.0 / n_grid
+        error = 0.0
         for i in range(n_features):
-            p_i = pit_values[:, i].view(-1, 1)
-            h = 1.06 * torch.std(p_i.detach()) * (batch_size ** -0.2) + 1e-5
-            phi_z = torch.exp(-0.5 * ((u_grid - p_i) / h)**2) / self.sqrt_2pi
-            f_hat = (1.0 / (batch_size * h)) * phi_z.sum(dim=0)
-            error += torch.sum((f_hat - 1.0)**2 * du)
+            p_i = pit_values[:, i]
+            h = 1.06 * p_i.detach().std() * (batch_size ** -0.2) + 1e-5
+            phi = torch.exp(-0.5 * ((u_grid.unsqueeze(0) - p_i.unsqueeze(1)) / h) ** 2) / self.sqrt_2pi
+            f_hat = phi.sum(dim=0) / (batch_size * h)
+            error += ((f_hat - 1.0) ** 2 * du).sum()
         return error / n_features
 
     def train_step(self, data_batch, dX, dT, loss_type='combined'):
-        self.pi_drift.train(); self.pi_diff.train()
+        self.pi_drift.train()
+        self.pi_diff.train()
         self.optimizer.zero_grad()
-        nu, sigma = self.pi_drift(data_batch), self.pi_diff(data_batch)
-        if torch.isnan(nu).any() or torch.isnan(sigma).any(): return float('inf'), float('inf'), float('inf')
-        dist = torch.distributions.StudentT(torch.tensor(4.0, device=self.device), loc=nu * dT, scale=sigma * torch.sqrt(dT))
-        nll = -dist.log_prob(dX).mean()
-        if torch.isnan(nll) or torch.isinf(nll): return float('inf'), float('inf'), float('inf')
-        loss, penalty_val = 0.0, 0.0
-        if loss_type == 'mse': loss = torch.mean((nu * dT - dX)**2)
-        elif loss_type == 'combined':
-            pit_vals = self.get_pit(nu, sigma, dX, dT)
-            penalty_val = self.density_penalty(pit_vals)
-            loss = nll + self.alpha_pit * penalty_val
-        if torch.isnan(loss) or torch.isinf(loss): return float('inf'), float('inf'), float('inf')
-        loss.backward()
+
+        with autocast(device_type='cuda' if self.device.type == 'cuda' else 'cpu'):
+            nu = self.pi_drift(data_batch)
+            sigma = self.pi_diff(data_batch)
+            if torch.isnan(nu).any() or torch.isnan(sigma).any():
+                return float('inf'), float('inf'), float('inf')
+
+            dist = torch.distributions.StudentT(self.nu, loc=nu * dT, scale=sigma * torch.sqrt(dT))
+            nll = -dist.log_prob(dX).mean()
+            if torch.isnan(nll) or torch.isinf(nll):
+                return float('inf'), float('inf'), float('inf')
+
+            penalty_val = 0.0
+            if loss_type == 'mse':
+                loss = torch.mean((nu * dT - dX) ** 2)
+            else:
+                pit_vals = self.get_pit(nu, sigma, dX, dT)
+                penalty_val = self.density_penalty(pit_vals)
+                loss = nll + self.alpha_pit * penalty_val
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                return float('inf'), float('inf'), float('inf')
+
+        self.scaler.scale(loss).backward()
+        self.scaler.unscale_(self.optimizer)
         torch.nn.utils.clip_grad_norm_(self.pi_drift.parameters(), 1.0)
         torch.nn.utils.clip_grad_norm_(self.pi_diff.parameters(), 1.0)
-        self.optimizer.step(); self.scheduler.step()
-        return loss.item(), nll.item(), (penalty_val if isinstance(penalty_val, float) else penalty_val.item())
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+        self.scheduler.step()
+        self.ema.update()
 
-# %% --- HELPER FUNCTIONS ---
+        return (loss.item(), nll.item(), penalty_val if isinstance(penalty_val, float) else penalty_val.item())
 
-def prepare_data(data, n_lags, device):
-    data = torch.tensor(data, dtype=torch.float32).to(device)
+
+# =============================================================================
+# --- Data Preparation ---
+# =============================================================================
+
+def prepare_data(data, n_lags, dev):
+    data = torch.tensor(data, dtype=torch.float32).to(dev)
     T_len = data.shape[0]
-
     if T_len <= n_lags:
         raise ValueError(f"Data length {T_len} is too short for n_lags={n_lags}")
-
-    # FIX: Slice to [:-1] to maintain the first valid window and prevent day-skipping
     data_seq = data.unfold(0, n_lags, 1)[:-1].transpose(1, 2)
-    
-    # FIX: Shift targets and next_vals to perfectly align with Day 40
-    targets = data[n_lags-1:-1, :]
+    targets = data[n_lags - 1:-1, :]
     next_vals = data[n_lags:, :]
-    
     dX = next_vals - targets
-    dT = torch.ones((dX.shape[0], 1)).to(device) * (1.0/252.0)
+    dT = torch.ones((dX.shape[0], 1), device=dev) * (1.0 / 252.0)
+    return data_seq, dX, dT
 
-    return data_seq, dX, dT, data
 
-def train_model(model, data_numpy, n_epochs=1000, batch_size=256, verbose=True, trial=None, val_data=None):
-    try:
-        X, dX, dT, _ = prepare_data(data_numpy, model.n_lags, model.device)
-        if val_data is not None: X_val, dX_val, dT_val, _ = prepare_data(val_data, model.n_lags, model.device)
-    except: return None, None, None, None
-    iterator = tqdm(range(n_epochs), desc="  ↳ Training", leave=False) if verbose else range(n_epochs)
+def train_model(model, data_numpy, n_epochs=1000, batch_size=256, verbose=True, trial=None):
+    X, dX, dT = prepare_data(data_numpy, model.n_lags, model.device)
+    iterator = tqdm(range(n_epochs), desc="Training", leave=False) if verbose else range(n_epochs)
     for epoch in iterator:
         idx = torch.randperm(X.shape[0])[:batch_size]
-        loss, nll, pen = model.train_step(X[idx], dX[idx], dT[idx], 'mse' if epoch < (n_epochs*0.1) else 'combined')
+        loss_type = 'mse' if epoch < (n_epochs * 0.1) else 'combined'
+        loss, nll, pen = model.train_step(X[idx], dX[idx], dT[idx], loss_type)
         if loss == float('inf'):
-            if trial: raise optuna.exceptions.TrialPruned()
+            if trial:
+                raise optuna.exceptions.TrialPruned()
             break
-        model.loss_history['total'].append(loss); model.loss_history['nll'].append(nll); model.loss_history['penalty'].append(pen)
-        if verbose and epoch % 10 == 0: iterator.set_postfix({'Loss': f"{loss:.4f}"})
-    return X, dX, dT, data_numpy
+        model.loss_history['total'].append(loss)
+        model.loss_history['nll'].append(nll)
+        model.loss_history['penalty'].append(pen)
+        if verbose and epoch % 10 == 0:
+            iterator.set_postfix({'Loss': f"{loss:.4f}", 'nu': f"{model.nu.item():.2f}"})
+    return X, dX, dT
+
+
+def get_residuals(model, data_numpy, n_lags):
+    """Extract standardized residuals z = (dX - mu*dT) / (sigma*sqrt(dT))."""
+    X, dX, dT = prepare_data(data_numpy, n_lags, model.device)
+    with model.ema.average_parameters():
+        model.eval()
+        with torch.no_grad():
+            nu = model.pi_drift(X)
+            sig = model.pi_diff(X)
+            Z = ((dX - nu * dT) / (sig * torch.sqrt(dT))).cpu().numpy()
+    return Z, X, dX, dT
+
+
+def compute_oos_metrics(model, X, dX, dT):
+    """Compute OOS log-likelihood and MSE using the learned Student-t distribution."""
+    with model.ema.average_parameters():
+        model.eval()
+        with torch.no_grad():
+            nu_pred = model.pi_drift(X)
+            sig_pred = model.pi_diff(X)
+            mse = torch.mean((nu_pred * dT - dX) ** 2).item()
+            loglik = torch.distributions.StudentT(
+                model.nu, loc=nu_pred * dT, scale=sig_pred * torch.sqrt(dT)
+            ).log_prob(dX).mean().item()
+    return mse, loglik
+
+
+# =============================================================================
+# --- Hyperparameter Optimization ---
+# =============================================================================
 
 def optimize_hyperparameters(data_numpy, column_name, n_trials=75):
-    print(f"  ↳ Running Bayesian Optimization ({n_trials} trials)...", end="", flush=True)
+    print(f"  HPO for {column_name} ({n_trials} trials, 3-fold TSCV)...")
     tscv = TimeSeriesSplit(n_splits=3)
+
     def objective(trial):
-        cfg = {'n_features': 1, 'n_lags': GLOBAL_N_LAGS, 'hidden_size': trial.suggest_categorical("hidden_size", [8, 16, 32]), 
-               'n_layers': trial.suggest_int("n_layers", 1, 2), 'alpha_pit': trial.suggest_float("alpha_pit", 50, 150), 
-               'lr': trial.suggest_float("lr", 1e-4, 1e-3, log=True), 'dropout': trial.suggest_float("dropout", 0.1, 0.4), 
-               'weight_decay': 1e-4}
+        cfg = {
+            'n_features': 1, 'n_lags': GLOBAL_N_LAGS,
+            'hidden_size': trial.suggest_categorical("hidden_size", [8, 16, 32]),
+            'n_layers': trial.suggest_int("n_layers", 1, 2),
+            'alpha_pit': trial.suggest_float("alpha_pit", 50, 150),
+            'lr': trial.suggest_float("lr", 1e-4, 1e-3, log=True),
+            'dropout': trial.suggest_float("dropout", 0.1, 0.4),
+            'weight_decay': 1e-4,
+        }
         scores = []
         for train_idx, val_idx in tscv.split(data_numpy):
             m = NeuralSDE(cfg, device=device)
-            v_start = max(0, val_idx[0] - GLOBAL_N_LAGS)
-            train_model(m, data_numpy[train_idx], 150, 128, False, trial, data_numpy[v_start:val_idx[-1]+1])
+            train_model(m, data_numpy[train_idx], 150, 128, False, trial)
             try:
-                X_v, dX_v, dT_v, _ = prepare_data(data_numpy[v_start:val_idx[-1]+1], GLOBAL_N_LAGS, device)
+                v_start = max(0, val_idx[0] - GLOBAL_N_LAGS)
+                X_v, dX_v, dT_v = prepare_data(data_numpy[v_start:val_idx[-1] + 1], GLOBAL_N_LAGS, device)
                 with torch.no_grad():
                     nu, sig = m.pi_drift(X_v), m.pi_diff(X_v)
-                    scores.append((-torch.distributions.StudentT(torch.tensor(4.0, device=device), nu*dT_v, sig*torch.sqrt(dT_v)).log_prob(dX_v).mean() + cfg['alpha_pit'] * m.density_penalty(m.get_pit(nu, sig, dX_v, dT_v))).item())
-            except: scores.append(1e6)
+                    nll_v = -torch.distributions.StudentT(m.nu, nu * dT_v, sig * torch.sqrt(dT_v)).log_prob(dX_v).mean()
+                    pen_v = m.density_penalty(m.get_pit(nu, sig, dX_v, dT_v))
+                    scores.append((nll_v + cfg['alpha_pit'] * pen_v).item())
+            except Exception:
+                scores.append(1e6)
         return np.mean(scores)
-    study = optuna.create_study(direction="minimize", pruner=optuna.pruners.MedianPruner(n_warmup_steps=20))
+
+    study = optuna.create_study(
+        direction="minimize",
+        pruner=optuna.pruners.MedianPruner(n_warmup_steps=20),
+        sampler=optuna.samplers.TPESampler(seed=42)
+    )
     study.optimize(objective, n_trials=n_trials)
-    print(" Done!"); return study.best_params
-
-def fit_evt_on_residuals(Z_numpy):
-    U, models = np.zeros_like(Z_numpy), []
-    for i in range(Z_numpy.shape[1]):
-        evt = EVT().fit(Z_numpy[:, i])
-        U[:, i] = evt.transform(Z_numpy[:, i])
-        models.append(evt)
-    return U, models
-
-def run_diagnostics(model, X, dX, dT, raw_data, column_name, save_path=None, U_numpy=None, phase="Train"):
-    model.eval()
     
-    # --- 1. PLOT CONVERGENCE ---
-    losses = model.loss_history
-    if losses['total'] and phase == "Train":
-        df_loss = pd.DataFrame(losses)
-        window = min(50, len(df_loss))
-        df_loss['total_smooth'] = df_loss['total'].rolling(window=window, min_periods=1).mean()
-        df_loss['penalty_smooth'] = df_loss['penalty'].rolling(window=window, min_periods=1).mean()
+    print(f"    Best: hidden={study.best_params.get('hidden_size')}, "
+          f"layers={study.best_params.get('n_layers')}, "
+          f"lr={study.best_params.get('lr', 0):.5f}")
+    return study.best_params
 
-        fig, ax1 = plt.subplots(figsize=(10, 4))
-        color = 'tab:blue'
-        ax1.set_xlabel('Epochs')
-        ax1.set_ylabel('Total Loss (SymLog)', color=color)
-        ax1.plot(df_loss['total'], color=color, alpha=0.15)
-        ax1.plot(df_loss['total_smooth'], color=color, linewidth=2)
-        ax1.set_yscale('symlog')
-        
-        ax2 = ax1.twinx()
-        color = 'tab:red'
-        ax2.set_ylabel('PIT Penalty', color=color)
-        ax2.plot(df_loss['penalty'], color=color, alpha=0.15, linestyle='--')
-        ax2.plot(df_loss['penalty_smooth'], color=color, linewidth=2, linestyle='--')
-        
-        plt.title(f"Training Convergence - {column_name}")
-        if save_path: 
-            plt.savefig(os.path.join(save_path, "convergence.png"), dpi=150, bbox_inches='tight')
-        plt.close()
 
-    # --- 2. GET PIT VALUES ---
-    with torch.no_grad():
-        nu, sig = model.pi_drift(X), model.pi_diff(X)
-        pit = model.get_pit(nu, sig, dX, dT).cpu().numpy()
-        
-    pit_flat = pit[:, 0]
-    ks_pit = kstest(pit_flat, 'uniform')[1]
-    
-    # --- 3. PLOT PRE-EVT PIT DIST ---
-    plt.figure(figsize=(6, 4))
-    plt.hist(pit_flat, bins=30, density=True, color='purple', alpha=0.6, edgecolor='black')
-    plt.axhline(1.0, color='red', lw=2, linestyle='--')
-    plt.title(f"PIT Distribution (Pre-EVT) - {column_name} ({phase})")
-    plt.text(0.98, 0.97, f'KS p-value: {ks_pit:.4f}', transform=plt.gca().transAxes, 
-             fontsize=10, verticalalignment='top', horizontalalignment='right', 
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    if save_path: 
-        plt.savefig(os.path.join(save_path, f"pit_dist_{phase.lower()}.png"), dpi=150, bbox_inches='tight')
+# =============================================================================
+# --- Diagnostics ---
+# =============================================================================
+
+def plot_fitted_curve(model, data_numpy, dates, column_name, n_lags, save_path, phase="Train"):
+    X, dX, dT = prepare_data(data_numpy, n_lags, model.device)
+    with model.ema.average_parameters():
+        model.eval()
+        with torch.no_grad():
+            nu_all = model.pi_drift(X).cpu().numpy()
+            sig_all = model.pi_diff(X).cpu().numpy()
+
+    dt_val = 1.0 / 252.0
+    nu_val = float(model.nu.item())
+    actual = data_numpy[n_lags:, 0]
+    center = data_numpy[n_lags - 1:-1, 0] + nu_all[:, 0] * dt_val
+    scale = sig_all[:, 0] * np.sqrt(dt_val)
+    plot_dates = dates[n_lags:]
+
+    fig, axes = plt.subplots(2, 1, figsize=(14, 8), gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.4})
+    ax = axes[0]
+    for level, color in [(0.50, '#cce5ff'), (0.90, '#66b0ff'), (0.95, '#1a6fc4')]:
+        tail = (1 - level) / 2
+        lo = scipy_t.ppf(tail, df=nu_val, loc=center, scale=scale)
+        hi = scipy_t.ppf(1 - tail, df=nu_val, loc=center, scale=scale)
+        ax.fill_between(plot_dates, lo, hi, alpha=0.35, color=color, label=f'{int(level * 100)}% CI')
+    ax.plot(plot_dates, actual, color='#e63946', lw=0.8, alpha=0.9, label='Actual')
+    ax.plot(plot_dates, center, color='#1d3557', lw=1.3, alpha=0.95, label='Fitted mean')
+    ax.set_title(f"NeuralSDE [{phase}]: {column_name}", fontsize=12, fontweight='bold')
+    ax.legend(loc='upper left', fontsize=8)
+    ax.grid(alpha=0.25)
+
+    ax2 = axes[1]
+    residuals = actual - center
+    colors = np.where(residuals >= 0, '#2a9d8f', '#e76f51')
+    ax2.bar(plot_dates, residuals, width=1, color=colors, alpha=0.65)
+    ax2.axhline(0, color='black', lw=0.8)
+    ax2.set_title("Residuals", fontsize=10)
+    ax2.grid(alpha=0.25)
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_path, f"{column_name}_{phase.lower()}_fitted.png"), dpi=150, bbox_inches='tight')
     plt.close()
 
-    # --- 4. PLOT POST-EVT UNIFORMS ---
-    if U_numpy is not None:
-        u_flat = U_numpy[:, 0]
-        ks_evt = kstest(u_flat, 'uniform')[1]
-        
-        plt.figure(figsize=(6, 4))
-        plt.hist(u_flat, bins=30, density=True, color='orange', alpha=0.6, edgecolor='black')
-        plt.axhline(1.0, color='red', lw=2, linestyle='--')
-        plt.title(f"EVT Uniforms (Post-EVT) - {column_name} ({phase})")
-        plt.text(0.98, 0.97, f'KS p-value: {ks_evt:.4f}', transform=plt.gca().transAxes, 
-                 fontsize=10, verticalalignment='top', horizontalalignment='right', 
-                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-        if save_path: 
-            plt.savefig(os.path.join(save_path, f"evt_uniforms_dist_{phase.lower()}.png"), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"  ↳ [{phase}] KS p: Pre-EVT={ks_pit:.4f}, Post-EVT={ks_evt:.4f}")
-        return ks_evt
-        
-    return ks_pit
 
-def save_artifacts(model, X, dX, dT, params, col, base):
-    folder = os.path.join(base, col); os.makedirs(folder, exist_ok=True)
-    with open(f"{folder}/best_nsde_params.json", "w") as f: json.dump(params, f, indent=4)
-    torch.save(model.state_dict(), f"{folder}/best_nsde_model.pth")
-    with torch.no_grad():
-        nu, sig = model.pi_drift(X), model.pi_diff(X)
-        Z = ((dX - nu * dT) / (sig * torch.sqrt(dT))).cpu().numpy()
-    np.save(f"{folder}/nsde_standardized_residuals_train.npy", Z)
-    return folder, Z
+def plot_diagnostics(u_values, column_name, phase, save_path):
+    """PIT histogram with KS test — matches HAR/NGARCH diagnostic style."""
+    ks_stat, ks_p = kstest(u_values, 'uniform')
+    
+    plt.figure(figsize=(6, 4))
+    plt.hist(u_values, bins=50, density=True, alpha=0.6, color='purple', ec='black')
+    plt.axhline(1.0, color='r', ls='--', lw=2, label='Uniform')
+    plt.text(0.05, 0.95, f'KS: {ks_stat:.3f}\np={ks_p:.3f}',
+             transform=plt.gca().transAxes, va='top',
+             bbox=dict(boxstyle='round', fc='wheat', alpha=0.5))
+    plt.title(f'NSDE Uniform Transform ({phase}): {column_name}')
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.savefig(os.path.join(save_path, f"{column_name}_{phase.lower()}_pit.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    return ks_p
 
-def get_predictions_and_residuals(model, data_numpy, dates, n_lags=40):
-    X, dX, dT, _ = prepare_data(data_numpy, n_lags, model.device)
-    model.eval()
-    with torch.no_grad():
-        nu, sig = model.pi_drift(X), model.pi_diff(X)
-        Z = ((dX - nu * dT) / (sig * torch.sqrt(dT))).cpu().numpy()
-    # FIX: Slice shifted to match new prepare_data logic
-    return Z, dates[n_lags:]
 
-# %% --- MAIN EXECUTION ---
+# =============================================================================
+# --- Main Pipeline ---
+# =============================================================================
 
 if __name__ == "__main__":
-    df_full = pd.read_csv('/kaggle/input/datasets/lucaleimbeckdelduca/factors/factors.csv', index_col=0, parse_dates=True).dropna().select_dtypes(include=[np.number])
-    split_date = pd.Timestamp("2025-01-02")
-    train_df, test_df = df_full[df_full.index < split_date], df_full[df_full.index >= split_date]
-    results_base_dir = "results_nsde_train_test"
-    os.makedirs(results_base_dir, exist_ok=True)
-    
-    all_best_params, failed_uniformity = {}, []
-    all_uniforms_train, all_uniforms_test = {}, {}
-    total_cols, alpha = len(df_full.columns), 0.05
+    seed_everything(42)
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+
+    file_path = os.path.join(project_root, "results", "factors", "factors.csv")
+    res_dir = os.path.join(project_root, "results", "dynamics", "NSDE")
+    diag_dir = os.path.join(res_dir, "plots")
+    os.makedirs(diag_dir, exist_ok=True)
+
+    SPLIT_DATE = pd.Timestamp("2025-01-02")
+    KS_ALPHA = 0.05
+
+    if not os.path.exists(file_path):
+        print(f"Error: Could not find {file_path}")
+        exit(1)
+
+    df_full = (pd.read_csv(file_path, index_col=0, parse_dates=True)
+               .dropna()
+               .select_dtypes(include=[np.number]))
+
+    train_df = df_full[df_full.index < SPLIT_DATE]
+    test_df = df_full[df_full.index >= SPLIT_DATE]
+    holdout_days = len(test_df)
+
+    print(f"Processing {df_full.shape[1]} factors.")
+    print(f"Train: {train_df.shape[0]} days | Test: {test_df.shape[0]} days\n")
+
+    # Storage
+    all_uniforms_train = {}
+    all_uniforms_test = {}
+    all_params = []
+    all_best_hpo = {}
+    ks_train_pass, ks_test_pass = 0, 0
+    total_cols = len(df_full.columns)
 
     for idx, col in enumerate(df_full.columns, 1):
-        print(f"▶ [{idx}/{total_cols}] Processing: {col}")
+        print(f"[{idx}/{total_cols}] {col}")
+
         col_train = train_df[[col]].values
-        
+        col_test_with_context = np.vstack([col_train[-GLOBAL_N_LAGS:], test_df[[col]].values])
+
+        # --- Step 1: HPO ---
         best_p = optimize_hyperparameters(col_train, col, n_trials=75)
-        all_best_params[col] = best_p
-        
-        final_model = NeuralSDE({**best_p, 'n_features': 1, 'n_lags': GLOBAL_N_LAGS}, device=device)
-        X_tr, dX_tr, dT_tr, _ = train_model(final_model, col_train, 800, best_p.get('batch_size', 128))
-        
-        if X_tr is None: continue
-        
-        # --- TRAIN SET EVT ---
-        Z_tr, tr_dates = get_predictions_and_residuals(final_model, col_train, train_df.index, GLOBAL_N_LAGS)
-        U_tr, evt_models = fit_evt_on_residuals(Z_tr)
-        
-        save_p, _ = save_artifacts(final_model, X_tr, dX_tr, dT_tr, best_p, col, results_base_dir)
-        run_diagnostics(final_model, X_tr, dX_tr, dT_tr, col_train, col, save_path=save_p, U_numpy=U_tr, phase="Train")
+        all_best_hpo[col] = best_p
 
-        # --- TEST SET EVALUATION ---
-        # Generate the test inputs by appending the holdout set to the last n_lags of the train set
-        test_inputs = np.vstack([col_train[-GLOBAL_N_LAGS:], test_df[[col]].values])
-        test_index = train_df.index[-GLOBAL_N_LAGS:].append(test_df.index)
+        # --- Step 2: Final training ---
+        seed_everything(42)
+        final_cfg = {**best_p, 'n_features': 1, 'n_lags': GLOBAL_N_LAGS}
+        model = NeuralSDE(final_cfg, device=device)
+        X_tr, dX_tr, dT_tr = train_model(model, col_train, n_epochs=800, batch_size=best_p.get('batch_size', 128))
+
+        # --- Step 3: Extract residuals ---
+        Z_tr, _, _, _ = get_residuals(model, col_train, GLOBAL_N_LAGS)
+        Z_te, _, _, _ = get_residuals(model, col_test_with_context, GLOBAL_N_LAGS)
         
-        Z_te, te_dates = get_predictions_and_residuals(final_model, test_inputs, test_index, GLOBAL_N_LAGS)
+        tr_dates = train_df.index[GLOBAL_N_LAGS:]
+        te_dates = test_df.index
 
-        # --- STATIC EVT FOR TEST SET (MATCHES HAR/NGARCH METHODOLOGY) ---
-        U_te = np.zeros_like(Z_te)
-        for i in range(Z_te.shape[1]):
-            U_te[:, i] = evt_models[i].transform(Z_te[:, i])
+        # --- Step 4: EVT transform ---
+        evt = EVT()
+        evt.fit(Z_tr[:, 0], lower_quantile=0.10, upper_quantile=0.10)
 
+        U_tr = np.clip(evt.transform(Z_tr[:, 0]), 1e-6, 1 - 1e-6)
+        U_te = np.clip(evt.transform(Z_te[:, 0]), 1e-6, 1 - 1e-6)
+
+        all_uniforms_train[col] = pd.Series(U_tr, index=tr_dates)
+        all_uniforms_test[col] = pd.Series(U_te, index=te_dates)
+
+        # --- Step 5: OOS metrics ---
+        mse_tr, loglik_tr = compute_oos_metrics(model, X_tr, dX_tr, dT_tr)
+        
+        mse_te, loglik_te = float('nan'), float('nan')
         try:
-            # Diagnostics on the test set
-            X_te_d, dX_te_d, dT_te_d, _ = prepare_data(test_inputs, GLOBAL_N_LAGS, final_model.device)
-            p_val = run_diagnostics(final_model, X_te_d, dX_te_d, dT_te_d, None, col, save_path=save_p, U_numpy=U_te, phase="Test")
-            
-            if p_val < alpha: 
-                failed_uniformity.append((col, p_val))
-                
-        except Exception as e: 
-            print(f"  ↳ ⚠️ Test Diag Fail: {e}")
+            X_te, dX_te, dT_te = prepare_data(col_test_with_context, GLOBAL_N_LAGS, model.device)
+            mse_te, loglik_te = compute_oos_metrics(model, X_te, dX_te, dT_te)
+        except Exception as e:
+            print(f"  Warning: OOS metrics failed for {col}: {e}")
 
-        all_uniforms_train[col], all_uniforms_test[col] = U_tr[:, 0], U_te[:, 0]
+        # --- Step 6: Diagnostics ---
+        ks_p_train = plot_diagnostics(U_tr, col, "Train", diag_dir)
+        ks_p_test = plot_diagnostics(U_te, col, "Test", diag_dir)
         
-        # Memory cleanup between iterations
-        del final_model
-        torch.cuda.empty_cache()
-        print("-" * 40)
+        plot_fitted_curve(model, col_train, train_df.index, col, GLOBAL_N_LAGS, diag_dir, "Train")
+        try:
+            plot_fitted_curve(model, col_test_with_context, 
+                              train_df.index[-GLOBAL_N_LAGS:].append(test_df.index),
+                              col, GLOBAL_N_LAGS, diag_dir, "Test")
+        except Exception:
+            pass
 
-    # ==========================================================
-    # --- AGGREGATE AND SAVE (MATCHING HAR/NGARCH INDEXING) ---
-    # ==========================================================
-    with open(f"{results_base_dir}/all_columns_params.json", "w") as f: 
-        json.dump(all_best_params, f, indent=4)
-        
-    if all_uniforms_train: 
-        train_df_out = pd.DataFrame(all_uniforms_train, index=tr_dates)
-        train_df_out.index = pd.to_datetime(train_df_out.index).date
-        train_df_out.index.name = "Date"
-        train_df_out.to_csv(f"{results_base_dir}/uniforms_nsde_train.csv")
-        
-    if all_uniforms_test: 
-        test_df_out = pd.DataFrame(all_uniforms_test, index=te_dates)
-        test_df_out.index = pd.to_datetime(test_df_out.index).date
-        test_df_out.index.name = "Date"
-        test_df_out.to_csv(f"{results_base_dir}/uniforms_nsde_test.csv")
-    
-    shutil.make_archive('nsde_results', 'zip', results_base_dir)
-    
-    print("\n" + "="*50)
-    print("📊 FINAL UNIFORMITY REPORT (Test Set)")
-    print("="*50)
-    if not failed_uniformity:
-        print(f"✅ All {total_cols} columns passed uniformity (p > {alpha}).")
-    else:
-        print(f"❌ {len(failed_uniformity)}/{total_cols} columns failed (p < {alpha}):")
-        for c, p in failed_uniformity: print(f"   - {c:.<20} p: {p:.5f}")
-    print("="*50)
-    print(f"✅ Processing Complete. Archive: nsde_results.zip")
+        if ks_p_train >= KS_ALPHA: ks_train_pass += 1
+        if ks_p_test >= KS_ALPHA: ks_test_pass += 1
+
+        train_passed = "PASS" if ks_p_train >= KS_ALPHA else "FAIL"
+        test_passed = "PASS" if ks_p_test >= KS_ALPHA else "FAIL"
+        print(f"  KS train p={ks_p_train:.3f} {train_passed} | KS test p={ks_p_test:.3f} {test_passed}")
+
+        all_params.append({
+            'factor': col,
+            'nu': round(model.nu.item(), 3),
+            'hidden_size': best_p.get('hidden_size'),
+            'n_layers': best_p.get('n_layers'),
+            'alpha_pit': round(best_p.get('alpha_pit', 0), 1),
+            'lr': best_p.get('lr'),
+            'dropout': best_p.get('dropout'),
+            'loglikelihood': round(loglik_tr, 4),
+            'loglikelihood_oos': round(loglik_te, 4),
+            'mse_train': round(mse_tr, 6),
+            'mse_test': round(mse_te, 6),
+            'ks_p_train': round(ks_p_train, 4),
+            'ks_p_test': round(ks_p_test, 4),
+        })
+
+        # Save per-factor model weights
+        factor_dir = os.path.join(res_dir, "models", col)
+        os.makedirs(factor_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(factor_dir, "model.pth"))
+        model.ema.store()
+        model.ema.copy_to()
+        torch.save(model.state_dict(), os.path.join(factor_dir, "model_ema.pth"))
+        model.ema.restore()
+
+        # Cleanup GPU memory
+        del model
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+    # --- Save CSVs (matching HAR_GARCH and NGARCH format) ---
+    train_out = pd.DataFrame(all_uniforms_train)
+    test_out = pd.DataFrame(all_uniforms_test)
+    train_out.index = pd.to_datetime(train_out.index).date
+    test_out.index = pd.to_datetime(test_out.index).date
+    train_out.index.name = "Date"
+    test_out.index.name = "Date"
+
+    train_out.to_csv(os.path.join(res_dir, "uniforms_nsde_train.csv"))
+    test_out.to_csv(os.path.join(res_dir, "uniforms_nsde_test.csv"))
+
+    p_df = pd.DataFrame(all_params)
+    p_df.to_csv(os.path.join(res_dir, "params_nsde.csv"), index=False)
+
+    with open(os.path.join(res_dir, "best_hpo_params.json"), "w") as f:
+        json.dump(all_best_hpo, f, indent=4)
+
+    # --- Uniformity Report (matching HAR/NGARCH format) ---
+    print(f"\n{'='*50}")
+    print(f"FINAL UNIFORMITY REPORT (Neural SDE)")
+    print(f"{'='*50}")
+    print(f"  Train: {ks_train_pass}/{total_cols} passed (p >= {KS_ALPHA})")
+    print(f"  Test:  {ks_test_pass}/{total_cols} passed (p >= {KS_ALPHA})")
+    print(f"{'='*50}")
+    print(f"\nResults saved to: {res_dir}")
