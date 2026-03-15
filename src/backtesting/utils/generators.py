@@ -131,9 +131,8 @@ class DynamicVineWrapper:
                     # Modify the Bicop IN THE LIST
                     pcs[tree][edge].parameters = params
                     
-        # 2. RE-INSTANTIATE THE VINECOP to force C++ to register the new parameters!
-        self.base_copula = pv.Vinecop(self.matrix, pcs)
-        
+        self.base_copula = pv.Vinecop(self.base_copula.structure, pcs)
+
 class UniversalScenarioGenerator:
     def __init__(self, factor_order, copula_model, model_id):
         self.factor_order = factor_order
