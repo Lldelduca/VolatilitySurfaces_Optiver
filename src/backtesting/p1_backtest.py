@@ -8,23 +8,16 @@ import torch
 import sys
 import pyvinecopulib as pv
 
-# Explicitly add root to path
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path: sys.path.insert(0, PROJECT_ROOT)
 
-# 1. IMPORT CLASSES FOR UNPICKLING
 from src.dynamics.HAR_GARCH import HAR_GARCH_EVT
 from src.dynamics.NeuralSDE import NeuralSDE
 from src.dynamics.NGARCH_T import NGARCH_T
-from src.dependence.gas_mixed_vine import DynamicGASVine 
-from src.dependence.neural_mixed_vine import DynamicNeuralVine
-
-# 2. IMPORT OUR CUSTOM PORTFOLIO & METRICS
 from src.backtesting.portfolio1 import Portfolio1_RiskReversal
 from src.backtesting.utils.risk_metrics import tick_loss, kupiec_pof_test, christoffersen_test, mcneil_frey_test, diebold_mariano_test
-from src.backtesting.utils.generators import UniversalScenarioGenerator
+from src.backtesting.utils.generators import UniversalScenarioGenerator, DynamicVineWrapper
 
-# Utility for unpickling custom classes safely
 class RiskModelUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
         if name == 'HAR_GARCH_EVT': return HAR_GARCH_EVT
@@ -32,18 +25,16 @@ class RiskModelUnpickler(pickle.Unpickler):
         if name == 'NeuralSDE': return NeuralSDE
         return super().find_class(module, name)
 
-# --- PRECOMPUTE HELPER ---
 def precompute_garch_states(valid_names, marginals, df_returns, df_factors, oos_dates, train_end):
-    """Calculates all deterministic states upfront for speed."""
     states = {n: [None] * len(oos_dates) for n in valid_names}
     for n in valid_names:
         m = marginals[n]
-        if hasattr(m, 'pi_drift'): # NSDE
+        if hasattr(m, 'pi_drift'): 
             arr, dates = (df_returns[n].values, df_returns.index) if n in df_returns.columns else (df_factors[n].values, df_factors.index)
             for i, t_today in enumerate(oos_dates):
                 loc_today = int(dates.searchsorted(t_today, side='right'))
                 if loc_today >= m.n_lags: states[n][i] = {'history': arr[loc_today - m.n_lags : loc_today]}
-        elif hasattr(m, 'params') and isinstance(m.params, list): # NGARCH
+        elif hasattr(m, 'params') and isinstance(m.params, list): 
             if n not in df_returns.columns: continue
             mu, omega, alpha, beta, theta, nu = m.params
             curr_sig2, curr_eps = m.vol[-1]**2, float(df_returns[n].loc[:train_end].iloc[-1]) - mu
@@ -52,7 +43,7 @@ def precompute_garch_states(valid_names, marginals, df_returns, df_factors, oos_
                 prev_sig = np.sqrt(curr_sig2)
                 curr_sig2 = omega + alpha * (((curr_eps / max(prev_sig, 1e-6) if prev_sig > 1e-6 else 0.0) - theta)**2) * curr_sig2 + beta * curr_sig2
                 curr_eps = rv - mu if not np.isnan(rv) else curr_eps
-        else: # HAR-GARCH
+        else: 
             if n not in df_factors.columns: continue
             p, arr, fac_dates = m.params, df_factors[n].values, df_factors.index
             curr_sig2, curr_resid = m.vol[-1]**2, m.resids[-1] * m.vol[-1]
@@ -74,7 +65,7 @@ def main():
     parser.add_argument('--paths', type=int, default=10000)
     args = parser.parse_args()
 
-    torch.set_num_threads(18) # Allows you to run 5 instances smoothly on 96 cores
+    torch.set_num_threads(18) 
     print(f"[*] Initializing Portfolio 1 Backtest for {args.model}...")
 
     DATA_DIR    = os.path.join(PROJECT_ROOT, "data", "processed")
@@ -84,30 +75,36 @@ def main():
     OOS_START   = pd.Timestamp("2025-01-02")
     OOS_END     = pd.Timestamp("2025-12-29")
 
-    # 1. PATH RESOLUTION BASED ON MODEL
-    if args.model == "M0":
-        MARG_PATH = "fitted_marginals.pkl"
-        COP_PATH  = "joint_vine_spot_har_garch_evt_model.json"
-    elif args.model in ["M1", "M2"]:
-        MARG_PATH = "fitted_marginals.pkl"
-        COP_PATH  = f"{'gas' if args.model=='M1' else 'neural'}_vine_spot_har_garch_evt_model.pth.zip"
-    elif args.model in ["M3", "M4"]:
-        MARG_PATH = "fitted_marginals.pkl"
-        COP_PATH  = f"{'gas' if args.model=='M3' else 'neural'}_vine_spot_nsde_model.pth.zip"
+    # 1. DYNAMIC PATH RESOLUTION 
+    if args.model in ["M0", "M1", "M2"]:
+        marg_model_name = "HAR_GARCH"
+    else:
+        marg_model_name = "NSDE"
+        
+    MARG_PATH = os.path.join("dynamics", marg_model_name, "fitted_marginals.pkl")
+
+    COP_DICT = {
+        "M0": "joint_vine_spot_har_garch_evt_model.json",
+        "M1": "gas_vine_spot_har_garch_evt_model.pth",
+        "M2": "neural_vine_spot_har_garch_evt_model.pth",
+        "M3": "gas_vine_spot_nsde_model.pth",
+        "M4": "neural_vine_spot_nsde_model.pth"
+    }
+    COP_PATH = os.path.join("copulas", "static" if args.model == "M0" else "gas" if args.model in ["M1", "M3"] else "neural", COP_DICT[args.model])
 
     # 2. DATA LOADING
-    df_factors = pd.read_csv(os.path.join(RESULTS_DIR, "hierarchical_all_factors.csv"), index_col=0, parse_dates=True)
-    df_returns = pd.read_csv(os.path.join(RESULTS_DIR, "returns.csv"), index_col=0, parse_dates=True)
+    df_factors = pd.read_csv(os.path.join(RESULTS_DIR, "factors", "hierarchical_all_factors.csv"), index_col=0, parse_dates=True)
+    df_returns = pd.read_csv(os.path.join(DATA_DIR, "returns.csv"), index_col=0, parse_dates=True)
     
     with open(os.path.join(RESULTS_DIR, MARG_PATH), "rb") as f:
         marginals = RiskModelUnpickler(f).load()
 
-    with open(os.path.join(RESULTS_DIR, "surfaces_dict.pkl"), "rb") as f:
+    with open(os.path.join(RESULTS_DIR, "factors", "surfaces_dict.pkl"), "rb") as f:
         surfaces_dict = pickle.load(f)
     
     _obj = next(iter(surfaces_dict.values()))
-    mat_arr = np.array(_obj.maturity_labels if hasattr(_obj, 'maturity_labels') else getattr(_obj, '_BA_MFPCA_Reconstruction__mat_labels'))
-    mon_arr = np.array(_obj.moneyness_labels if hasattr(_obj, 'moneyness_labels') else getattr(_obj, '_BA_MFPCA_Reconstruction__mon_labels'))
+    mat_arr = np.array(_obj.maturity_labels if hasattr(_obj, 'maturity_labels') else getattr(_obj, '_Reconstruction__mat_labels'))
+    mon_arr = np.array(_obj.moneyness_labels if hasattr(_obj, 'moneyness_labels') else getattr(_obj, '_Reconstruction__mon_labels'))
 
     valid_names = [c for c in df_returns.columns if c in marginals] + [c for c in df_factors.columns if c in marginals]
     name_to_col = {n: i for i, n in enumerate(valid_names)}
@@ -127,20 +124,21 @@ def main():
 
     # 3. COPULA & GENERATOR SETUP
     full_cop_path = os.path.join(RESULTS_DIR, COP_PATH)
+    
     if args.model == "M0":
         copula = pv.Vinecop.from_file(full_cop_path)
-    elif args.model in ["M1", "M3"]:
-        copula = DynamicGASVine(full_cop_path, os.path.join(RESULTS_DIR, "joint_vine_spot_har_garch_evt_model.json"))
-    elif args.model in ["M2", "M4"]:
-        # Load Warmup for RNN
-        unif_path = "uniforms_nsde_train.csv" if args.model == "M4" else "uniforms_har_garch_evt_train.csv"
-        df_unif = pd.read_csv(os.path.join(RESULTS_DIR, unif_path), index_col=0, parse_dates=True)
-        # Add Spot (NGARCH) Uniforms
-        df_spot = pd.read_csv(os.path.join(RESULTS_DIR, "uniforms_ngarch_t_train.csv"), index_col=0, parse_dates=True)
+    else:
+        # Load Warmup Uniforms for the Rolling Window
+        unif_dir = os.path.join(RESULTS_DIR, "dynamics", "NSDE" if args.model in ["M3", "M4"] else "HAR_GARCH")
+        df_unif = pd.read_csv(os.path.join(unif_dir, "uniforms_train.csv"), index_col=0, parse_dates=True)
+        df_spot = pd.read_csv(os.path.join(RESULTS_DIR, "dynamics", "NGARCH", "uniforms_train.csv"), index_col=0, parse_dates=True)
         df_unif = pd.concat([df_spot, df_unif], axis=1).reindex(columns=valid_names).ffill().bfill()
         
-        history_window = df_unif.iloc[-60:].values # 60 days warmup
-        copula = DynamicNeuralVine(full_cop_path, os.path.join(RESULTS_DIR, "joint_vine_spot_har_garch_evt_model.json"), history_window)
+        history_window = df_unif.iloc[-60:].values 
+        static_base = os.path.join(RESULTS_DIR, "copulas", "static", "joint_vine_spot_har_garch_evt_model.json")
+        
+        # Use our new Wrapper that handles both GAS and Neural
+        copula = DynamicVineWrapper(full_cop_path, static_base, history_window, "GAS" if args.model in ["M1", "M3"] else "Neural")
 
     generator = UniversalScenarioGenerator(valid_names, copula, args.model)
     generator.classify_marginals(marginals)
@@ -162,7 +160,6 @@ def main():
         t0 = next((d for d in reversed(available_dates) if d <= t_today), available_dates[-1])
         df_today = parquet_by_date[t0]
         
-        # Instantiate Portfolio and Fit SSVI on the fly
         portfolio = Portfolio1_RiskReversal(df_today, t0, n_contracts=1000, target_dte=30)
         if not portfolio.rrs: continue
 
@@ -193,17 +190,23 @@ def main():
     df_res = pd.DataFrame(results)
     rpnl, vh, ih = df_res['Realized_PnL'].values, df_res['Vine_Hit'].values, df_res['Indep_Hit'].values
 
-    vine_mf_p = mcneil_frey_test(rpnl, df_res['Vine_ES'].values, df_res['Vine_Std'].values, vh)[1]
-    dm_pval = diebold_mariano_test(tick_loss(rpnl, df_res['Vine_VaR'].values, ALPHA), tick_loss(rpnl, df_res['Indep_VaR'].values, ALPHA), h=1)[1]
+    # Run all tests
+    vine_kup_p = kupiec_pof_test(vh, ALPHA)
+    vine_cc_p, vine_ind_p, vine_uc_p = christoffersen_test(vh, ALPHA)
+    vine_mf_stat, vine_mf_p, _ = mcneil_frey_test(rpnl, df_res['Vine_ES'].values, df_res['Vine_Std'].values, vh)
+    dm_stat, dm_pval, dm_diff = diebold_mariano_test(tick_loss(rpnl, df_res['Vine_VaR'].values, ALPHA), tick_loss(rpnl, df_res['Indep_VaR'].values, ALPHA), h=1)
 
     print(f"\n{'='*60}")
     print(f" BACKTEST COMPLETE: {args.model} | P1: RISK REVERSAL")
     print(f"{'='*60}")
     print(f" Vine Exceedances: {vh.sum()} | Target: {len(df_res)*ALPHA:.1f}")
+    print(f" Kupiec POF p-value: {vine_kup_p:.4f} (PASS if > {ALPHA})")
+    print(f" Christoffersen CC p-value: {vine_cc_p:.4f} (PASS if > {ALPHA})")
     print(f" McNeil-Frey p-value: {vine_mf_p:.4f} (PASS if > {ALPHA})")
     print(f" Diebold-Mariano p-value: {dm_pval:.4f}")
     
-    out_path = os.path.join(RESULTS_DIR, f"p1_results_{args.model}.csv")
+    os.makedirs(os.path.join(RESULTS_DIR, "backtests"), exist_ok=True)
+    out_path = os.path.join(RESULTS_DIR, "backtests", f"p1_results_{args.model}.csv")
     df_res.to_csv(out_path, index=False)
     print(f" Saved to {out_path}")
 

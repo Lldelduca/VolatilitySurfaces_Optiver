@@ -496,7 +496,11 @@ def fit_single_neural_edge(tree, edge, partner_col, fam_str, rotation, static_th
         'oos_forecast': model.oos_forecast.item(),
         'nll': final_nll,
         'aic': aic,
-        'bic': bic
+        'bic': bic,
+        'state_dict': {k: v.cpu() for k, v in best_state.items()} if best_state is not None else None,
+        'hidden_dim': hpo_params['hidden_dim'],
+        'num_layers': hpo_params['num_layers'],
+        'dropout': hpo_params.get('dropout', 0.0)
     }
     
     return edge, partner_col, result_dict, h_direct, h_indirect

@@ -1,20 +1,35 @@
 import numpy as np
+import pandas as pd
 from src.backtesting.utils.black_scholes import bs_price_vec, bs_delta_vec, bilinear_interp_vec
 
-class Portfolio1_RiskReversal:
-    def __init__(self, market_t0, n_contracts=1000, target_dte=30):
-        self.n_contracts = n_contracts
-        self.rrs = self._build_book(market_t0, target_dte)
+from src.fitting.ssvi import SSVI 
 
-    def _build_book(self, market_t0, target_dte):
-        rrs, df_raw = [], market_t0['df_raw']
+class Portfolio1_RiskReversal:
+    def __init__(self, df_today, current_date, n_contracts=1000, target_dte=30):
+        self.n_contracts = n_contracts
+        # Pass the specific day's DataFrame and date to build the book
+        self.rrs = self._build_book(df_today, current_date, target_dte)
+
+    def _build_book(self, df_today, current_date, target_dte):
+        rrs = []
         target_tau = target_dte / 365.25
         
-        for sym, S0 in market_t0['spots'].items():
-            surf = market_t0['surfaces'].get(sym)
-            if not surf: continue
+        for sym in df_today['underlying_symbol'].unique():
+            sub = df_today[df_today['underlying_symbol'] == sym].copy()
+            if sub.empty: continue
             
-            sub = df_raw[df_raw['underlying_symbol'] == sym]
+            S0 = sub['underlying_mid_price'].mean()
+            # Default to 0.0 if rate is missing, else convert from %
+            r0 = float(sub['rate'].mean() / 100.0) if 'rate' in sub.columns else 0.0
+
+            # --- 1. FIT SSVI ON THE FLY ---
+            try:
+                surf = SSVI(sub, symbol=sym, quote_datetime=current_date)
+                surf.fit(max_iter=5000)
+            except Exception:
+                continue
+
+            # --- 2. FIND CLOSEST OPTIONS ---
             win = sub[(sub['tau'] >= 25/365.25) & (sub['tau'] <= 45/365.25)]
             if win.empty: continue
 
@@ -27,17 +42,18 @@ class Portfolio1_RiskReversal:
             K_P = float(win_p.loc[(win_p['delta'] + 0.25).abs().idxmin()]['strike'])
             
             try:
-                sig_C, sig_P = surf.get_iv(K_C, best_tau, S0), surf.get_iv(K_P, best_tau, S0)
+                sig_C = surf.get_iv(K_C, best_tau, S_current=S0, r=r0)
+                sig_P = surf.get_iv(K_P, best_tau, S_current=S0, r=r0)
                 if any(s is None or s <= 0 or np.isnan(s) for s in [sig_C, sig_P]): continue
             except Exception: continue
 
-            price_C = float(bs_price_vec(S0, K_C, best_tau, sig_C, 0.0, 'C'))
-            price_P = float(bs_price_vec(S0, K_P, best_tau, sig_P, 0.0, 'P'))
-            delta0  = float(bs_delta_vec(S0, K_C, best_tau, sig_C, 0.0, 'C') - 
-                            bs_delta_vec(S0, K_P, best_tau, sig_P, 0.0, 'P'))
+            price_C = float(bs_price_vec(S0, K_C, best_tau, sig_C, r0, 'C'))
+            price_P = float(bs_price_vec(S0, K_P, best_tau, sig_P, r0, 'P'))
+            delta0  = float(bs_delta_vec(S0, K_C, best_tau, sig_C, r0, 'C') - 
+                            bs_delta_vec(S0, K_P, best_tau, sig_P, r0, 'P'))
             
             rrs.append({
-                'sym': sym, 'S0': S0, 'tau': best_tau, 
+                'sym': sym, 'S0': S0, 'tau': best_tau, 'r0': r0,
                 'K_C': K_C, 'sig_C': sig_C, 'K_P': K_P, 'sig_P': sig_P, 
                 'n': self.n_contracts, 'delta0': delta0, 'val_0': price_C - price_P
             })
@@ -67,8 +83,8 @@ class Portfolio1_RiskReversal:
             except Exception:
                 sig1_C, sig1_P = np.full(N, s['sig_C']), np.full(N, s['sig_P'])
 
-            val1_C = bs_price_vec(S1, s['K_C'], tau1, sig1_C, 0.0, 'C')
-            val1_P = bs_price_vec(S1, s['K_P'], tau1, sig1_P, 0.0, 'P')
+            val1_C = bs_price_vec(S1, s['K_C'], tau1, sig1_C, s['r0'], 'C')
+            val1_P = bs_price_vec(S1, s['K_P'], tau1, sig1_P, s['r0'], 'P')
             
             pnl += ((val1_C - val1_P - s['val_0']) * s['n'] + (-s['delta0'] * s['n']) * (S1 - s['S0']))
             
