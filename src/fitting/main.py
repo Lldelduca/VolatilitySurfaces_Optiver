@@ -19,7 +19,7 @@ def main():
         symbols = json.load(f)["symbols"]
 
     raw_data_path = "data/processed/options_surfaces_data_cleaned.parquet"
-    save_directory = "data/ssvi_surfaces_output"
+    save_directory = "results/fitting"
 
     # 3. Initialize the multiprocessing generator
     gen = SurfaceGenerator(
