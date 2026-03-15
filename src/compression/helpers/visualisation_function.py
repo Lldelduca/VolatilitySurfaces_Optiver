@@ -202,7 +202,7 @@ def plot_single_asset_scores(df, symbol):
     plt.tight_layout()
     plt.show()
 
-def plot_surfaces_for_latex(data, folder_prefix="res/fpca_fit/global", color_multiplier=0.7):
+def plot_surfaces_for_latex(data, folder_prefix="results/factors/global", color_multiplier=0.7):
 
     X, Y = np.meshgrid(g.K_GRID, g.T_GRID)
 

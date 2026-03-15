@@ -266,7 +266,7 @@ if __name__ == "__main__":
         if plot_surfaces:
             plot_surfaces_for_latex(
                 fpca_local.components_.data_matrix[:M_j].reshape(M_j, g.N_MATURITY, g.N_MONEYNESS),
-                f"results/figures/fpca/local/{symbol}",
+                f"results/factors/local/{symbol}",
                 color_multiplier=0.7
             )
 
