@@ -267,7 +267,6 @@ class UniversalScenarioGenerator:
         paths = np.zeros((n_scenarios, horizon, dim))
         n_total = n_scenarios * horizon
         
-        # 1. Draw all uniforms at once from the frozen t=0 Copula
         if use_copula and self.copula is not None:
             U_all = np.clip(self.copula.simulate(n_total), 1e-6, 1 - 1e-6)
         else:
@@ -275,7 +274,6 @@ class UniversalScenarioGenerator:
             
         U_all = U_all.reshape((horizon, n_scenarios, dim))
 
-        # 2. Extract initial states
         sig2_n = np.array([init_states[self.factor_order[i]]['sigma2'] for i in self._ng_idx]) if self._ng_idx else None
         eps_n = np.array([init_states[self.factor_order[i]]['resid'] for i in self._ng_idx]) if self._ng_idx else None
         
@@ -301,7 +299,6 @@ class UniversalScenarioGenerator:
 
         dt = 1.0 / 252.0
 
-        # 3. Project paths forward sequentially
         for t in range(horizon):
             U = U_all[t]
             
@@ -331,16 +328,18 @@ class UniversalScenarioGenerator:
                 hist_h = np.concatenate([hist_h[:, :, 1:], val_h[:, :, np.newaxis]], axis=2)
 
             if self._nsde_idx:
+                if not hasattr(self, '_nsde_windows'):
+                    self._nsde_windows = {}
+                    
                 for d_idx in self._nsde_idx:
                     n_name, m = self.factor_order[d_idx], marginals[self.factor_order[d_idx]]
-                    # Use actual projected history for t > 0
-                    if t == 0:
-                        window_data = init_states[n_name]['history'][-m.n_lags:]
-                        window_data = np.tile(window_data, (n_scenarios, 1))
-                    else:
-                        window_data = np.concatenate([window_data[:, 1:], paths[:, t-1, d_idx:d_idx+1]], axis=1)
                     
-                    window = torch.tensor(window_data, dtype=torch.float64, device=m.device).unsqueeze(-1)
+                    if t == 0:
+                        self._nsde_windows[d_idx] = np.tile(init_states[n_name]['history'][-m.n_lags:], (n_scenarios, 1))
+                    else:
+                        self._nsde_windows[d_idx] = np.concatenate([self._nsde_windows[d_idx][:, 1:], paths[:, t-1, d_idx:d_idx+1]], axis=1)
+                        
+                    window = torch.tensor(self._nsde_windows[d_idx], dtype=torch.float64, device=m.device).unsqueeze(-1)
                     with torch.no_grad():
                         mu_p = m.pi_drift(window).squeeze(-1).numpy()
                         sig_p = m.pi_diff(window).squeeze(-1).numpy()
