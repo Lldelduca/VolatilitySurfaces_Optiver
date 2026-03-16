@@ -90,3 +90,61 @@ class Portfolio1_RiskReversal:
             pnl += ((val1_C - val1_P - s['val_0']) * s['n'] + (-s['delta0'] * s['n']) * (S1 - s['S0']))
             
         return pnl
+    
+    def evaluate_multiday_hedged_pnl(self, paths, valid_names, surfaces_dict, name_to_idx, mat_arr, mon_arr, horizon, factor_idx_map):
+        N = paths.shape[0]
+        dt = 1.0 / 252.0
+        
+        S = {s['sym']: np.full(N, s['S0'], dtype=float) for s in self.rrs}
+        hedge_qty = {s['sym']: np.full(N, -s['delta0'] * s['n'], dtype=float) for s in self.rrs}
+        hedge_cash = {s['sym']: np.full(N, -((-s['delta0'] * s['n'] * s['S0']) + (s['val_0'] * s['n'])), dtype=float) for s in self.rrs}
+        
+        sigma_prev_C = {s['sym']: np.full(N, s['sig_C'], dtype=float) for s in self.rrs}
+        sigma_prev_P = {s['sym']: np.full(N, s['sig_P'], dtype=float) for s in self.rrs}
+        he_per_asset = {s['sym']: np.zeros(N, dtype=float) for s in self.rrs}
+
+        for t in range(horizon):
+            S_prev = {sym: arr.copy() for sym, arr in S.items()}
+            
+            for sym in S:
+                col_idx = name_to_idx.get(sym)
+                if col_idx is not None:
+                    S[sym] = np.clip(S[sym] * np.exp(paths[:, t, col_idx]), 1e-4, 1e10)
+
+            g_idx = factor_idx_map.get("G_PC", [])
+            g_mat = paths[:, t, g_idx] if g_idx else np.zeros((N, 3))
+
+            for s in self.rrs:
+                sym, K_C, K_P, n_c, r_0 = s['sym'], s['K_C'], s['K_P'], s['n'], s['r0']
+                tau_t = s['tau'] - (t + 1) * dt
+                if tau_t <= 1e-5: continue
+
+                hedge_cash[sym] *= np.exp(r_0 * dt)
+                l_idx = factor_idx_map.get(sym, [])
+                l_mat = paths[:, t, l_idx] if l_idx else np.zeros((N, 3))
+                S_vec, dS_vec = S[sym], S[sym] - S_prev[sym]
+
+                try:
+                    grids = surfaces_dict[sym].reconstruct(global_param=g_mat, local_param=l_mat)
+                    sigma_t_C = np.exp(np.clip(bilinear_interp_vec(grids, mat_arr, mon_arr, tau_t, np.log(K_C / S_vec)), -10.0, 3.0))
+                    sigma_t_P = np.exp(np.clip(bilinear_interp_vec(grids, mat_arr, mon_arr, tau_t, np.log(K_P / S_vec)), -10.0, 3.0))
+                except Exception: 
+                    sigma_t_C, sigma_t_P = sigma_prev_C[sym].copy(), sigma_prev_P[sym].copy()
+
+                delta_C = bs_delta_vec(S_vec, K_C, tau_t, sigma_t_C, r_0, 'C')
+                delta_P = bs_delta_vec(S_vec, K_P, tau_t, sigma_t_P, r_0, 'P')
+                
+                target_qty = -(delta_C - delta_P) * n_c
+                hedge_cash[sym] -= (target_qty - hedge_qty[sym]) * S_vec
+                hedge_qty[sym] = target_qty
+
+                # Track Hedging Error (Vanna proxy)
+                from src.backtesting.utils.black_scholes import vanna_bs_vec
+                vanna_C = vanna_bs_vec(S_vec, K_C, tau_t, sigma_t_C, r_0)
+                vanna_P = vanna_bs_vec(S_vec, K_P, tau_t, sigma_t_P, r_0)
+                he_per_asset[sym] += np.nan_to_num((vanna_C * (sigma_t_C - sigma_prev_C[sym]) - vanna_P * (sigma_t_P - sigma_prev_P[sym])) * n_c * dS_vec, 0.0)
+
+                sigma_prev_C[sym], sigma_prev_P[sym] = sigma_t_C, sigma_t_P
+
+        pnl_hedge = sum(np.nan_to_num(hedge_cash[sym] + hedge_qty[sym] * S[sym], 0.0) for s in self.rrs)
+        return {'he_total': sum(he_per_asset.values()), 'pnl_hedge': pnl_hedge}

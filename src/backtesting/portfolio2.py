@@ -140,3 +140,44 @@ class Portfolio2_Dispersion:
             pnl += (price1_j - self.book['val_0_const'][sym]) * self.book['n_j'][sym]
 
         return pnl
+    
+    def evaluate_multiday_terminal_pnl(self, paths, valid_names, surfaces_dict, name_to_idx, mat_arr, mon_arr, horizon, factor_idx_map):
+        if not self.book['valid']: return {'pnl_total': np.zeros(paths.shape[0])}
+        
+        N = paths.shape[0]
+        tau_term = horizon * (1.0 / 252.0)
+        pnl_total = np.zeros(N)
+        
+        g_idx = factor_idx_map.get("G_PC", [])
+        g_mat_T = paths[:, :, g_idx].sum(axis=1) if g_idx else np.zeros((N, 3))
+
+        def reprice_terminal(leg):
+            sym, S0, K = leg['sym'], leg['S0'], leg['K']
+            tau_rem = max(leg['tau'] - tau_term, 1e-6)
+            
+            col = name_to_idx.get(sym)
+            S_T = np.clip(S0 * np.exp(paths[:, :, col].sum(axis=1)), 1e-4, 1e10) if col is not None else np.full(N, S0)
+
+            if sym not in name_to_idx or sym not in surfaces_dict:
+                sig_T = np.full(N, leg['sigma0'])
+            else:
+                l_idx = factor_idx_map.get(sym, [])
+                l_mat_T = paths[:, :, l_idx].sum(axis=1) if l_idx else np.zeros((N, 3))
+                try:
+                    grids = surfaces_dict[sym].reconstruct(global_param=g_mat_T, local_param=l_mat_T)
+                    sig_T = np.exp(np.clip(bilinear_interp_vec(grids, mat_arr, mon_arr, tau_rem, np.log(K / np.clip(S_T, 1e-8, np.inf))), -10, 3))
+                except Exception:
+                    sig_T = np.full(N, leg['sigma0'])
+
+            return bs_straddle_price_vec(S_T, K, tau_rem, sig_T, self.r0)
+
+        # Index leg (short)
+        price_T_idx = reprice_terminal(self.book['idx_data'])
+        pnl_total += (price_T_idx - self.book['val_0_idx']) * (-self.book['n_I'])
+
+        # Constituent legs (long)
+        for sym, leg in self.book['const_data'].items():
+            price_T_j = reprice_terminal(leg)
+            pnl_total += (price_T_j - self.book['val_0_const'][sym]) * self.book['n_j'][sym]
+
+        return {'pnl_total': pnl_total}

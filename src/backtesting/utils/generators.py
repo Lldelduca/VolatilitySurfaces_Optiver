@@ -257,6 +257,98 @@ class UniversalScenarioGenerator:
                 paths_i[:, d_idx] = mu_pred * dt + sig_pred * np.sqrt(dt) * student_t.ppf(U_i[:, d_idx], df=nu)
 
         return paths_j, paths_i
+    
+    # Add this method to UniversalScenarioGenerator in generators.py
+    def simulate_multiday(self, n_scenarios, horizon, init_states, marginals, use_copula=True):
+        if not self._ng_idx and not self._har_idx and not self._nsde_idx: 
+            self.classify_marginals(marginals)
+            
+        dim = len(self.factor_order)
+        paths = np.zeros((n_scenarios, horizon, dim))
+        n_total = n_scenarios * horizon
+        
+        # 1. Draw all uniforms at once from the frozen t=0 Copula
+        if use_copula and self.copula is not None:
+            U_all = np.clip(self.copula.simulate(n_total), 1e-6, 1 - 1e-6)
+        else:
+            U_all = np.random.uniform(1e-6, 1 - 1e-6, size=(n_total, dim))
+            
+        U_all = U_all.reshape((horizon, n_scenarios, dim))
+
+        # 2. Extract initial states
+        sig2_n = np.array([init_states[self.factor_order[i]]['sigma2'] for i in self._ng_idx]) if self._ng_idx else None
+        eps_n = np.array([init_states[self.factor_order[i]]['resid'] for i in self._ng_idx]) if self._ng_idx else None
+        
+        sig2_h = np.array([init_states[self.factor_order[i]]['sigma2'] for i in self._har_idx]) if self._har_idx else None
+        resid_h = np.array([init_states[self.factor_order[i]]['resid'] for i in self._har_idx]) if self._har_idx else None
+        
+        hist_h = np.zeros((n_scenarios, len(self._har_idx), 22)) if self._har_idx else None
+        if self._har_idx:
+            for j, idx in enumerate(self._har_idx):
+                hist_h[:, j, :] = np.tile(init_states[self.factor_order[idx]]['history'][-22:], (n_scenarios, 1))
+
+        if self._ng_idx:
+            sig2_n = np.tile(sig2_n, (n_scenarios, 1))
+            eps_n = np.tile(eps_n, (n_scenarios, 1))
+            p_n = np.array([marginals[self.factor_order[i]].params for i in self._ng_idx])
+            mu_n, om_n, al_n, be_n, th_n, nu_n = [p_n[:, k].reshape(1, -1) for k in range(6)]
+
+        if self._har_idx:
+            sig2_h = np.tile(sig2_h, (n_scenarios, 1))
+            resid_h = np.tile(resid_h, (n_scenarios, 1))
+            p_h = np.array([[marginals[self.factor_order[i]].params[k] for k in ['har_intercept', 'har_daily', 'har_weekly', 'har_monthly', 'garch_omega', 'garch_alpha', 'garch_beta']] for i in self._har_idx])
+            h_int, h_d, h_w, h_m, g_om, g_al, g_be = [p_h[:, k].reshape(1, -1) for k in range(7)]
+
+        dt = 1.0 / 252.0
+
+        # 3. Project paths forward sequentially
+        for t in range(horizon):
+            U = U_all[t]
+            
+            if self._ng_idx:
+                U_n = U[:, self._ng_idx]
+                z_n = student_t.ppf(U_n, df=nu_n)
+                prev_sig = np.sqrt(sig2_n)
+                prev_z = np.where(prev_sig > 1e-6, eps_n / np.maximum(prev_sig, 1e-6), 0.0)
+                next_sig2 = om_n + al_n * ((prev_z - th_n)**2) * sig2_n + be_n * sig2_n
+                shock_n = np.sqrt(next_sig2) * z_n
+                paths[:, t, self._ng_idx] = mu_n + shock_n
+                sig2_n, eps_n = next_sig2, shock_n
+
+            if self._har_idx:
+                U_h = U[:, self._har_idx]
+                z_h = np.zeros_like(U_h)
+                for j, idx in enumerate(self._har_idx):
+                    m = marginals[self.factor_order[idx]]
+                    z_h[:, j] = m.evt_model.inverse_transform(U_h[:, j]) if hasattr(m, 'evt_model') else norm.ppf(U_h[:, j])
+                
+                next_sig2_h = g_om + g_al * (resid_h**2) + g_be * sig2_h
+                mean_h = h_int + h_d * hist_h[:, :, -1] + h_w * hist_h[:, :, -5:].mean(axis=2) + h_m * hist_h.mean(axis=2)
+                shock_h = np.sqrt(next_sig2_h) * z_h
+                val_h = mean_h + shock_h
+                paths[:, t, self._har_idx] = val_h
+                sig2_h, resid_h = next_sig2_h, shock_h
+                hist_h = np.concatenate([hist_h[:, :, 1:], val_h[:, :, np.newaxis]], axis=2)
+
+            if self._nsde_idx:
+                for d_idx in self._nsde_idx:
+                    n_name, m = self.factor_order[d_idx], marginals[self.factor_order[d_idx]]
+                    # Use actual projected history for t > 0
+                    if t == 0:
+                        window_data = init_states[n_name]['history'][-m.n_lags:]
+                        window_data = np.tile(window_data, (n_scenarios, 1))
+                    else:
+                        window_data = np.concatenate([window_data[:, 1:], paths[:, t-1, d_idx:d_idx+1]], axis=1)
+                    
+                    window = torch.tensor(window_data, dtype=torch.float64, device=m.device).unsqueeze(-1)
+                    with torch.no_grad():
+                        mu_p = m.pi_drift(window).squeeze(-1).numpy()
+                        sig_p = m.pi_diff(window).squeeze(-1).numpy()
+                        nu_v = m.nu.item()
+                        
+                    paths[:, t, d_idx] = mu_p * dt + sig_p * np.sqrt(dt) * student_t.ppf(U[:, d_idx], df=nu_v)
+
+        return paths
 
     def calculate_realized_uniforms(self, realized_row, init_states, marginals):
         u_realized = np.zeros(len(self.factor_order))
