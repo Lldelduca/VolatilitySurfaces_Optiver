@@ -2,6 +2,8 @@ import numpy as np
 import torch
 import pyvinecopulib as pv
 from scipy.stats import norm, t as student_t
+
+# Import your PyTorch Copula modules
 from src.dependence.gas_mixed_vine import GASPairCopula
 from src.dependence.neural_mixed_vine import NeuralPairCopula
 
@@ -46,6 +48,8 @@ class DynamicVineWrapper:
                         m.load_state_dict(info['state_dict'])
                         
                 m.eval()
+                
+                # Attach OOS forecast from the training dictionary
                 m.oos_forecast = torch.tensor(info.get('oos_forecast', 0.0))
                 self.models[edge_key] = m
                 
@@ -80,11 +84,11 @@ class DynamicVineWrapper:
                     h_storage[(edge, tree)] = u_vec
                     if tree < self.N - 2: h_storage[(partner_col, tree)] = v_vec
                 else:
-                    # --- FIX 2: CONDITIONAL AUTOGRAD FOR GAS ---
-                    if hasattr(m, 'rnn'): # Neural Copula
+                    # Conditional Autograd depending on Neural vs GAS
+                    if hasattr(m, 'rnn'): 
                         with torch.no_grad():
                             _, theta_seq = m(u_vec, v_vec)
-                    else: # GAS Copula (Requires internal autograd for Archimedean score)
+                    else: 
                         with torch.enable_grad():
                             _, theta_seq = m(u_vec, v_vec)
                             
@@ -100,15 +104,23 @@ class DynamicVineWrapper:
         self._push_to_cpp()
 
     def _push_to_cpp(self):
-        # 1. Extract the full nested list of pair copulas
-        pcs = self.base_copula.pair_copulas 
+        # 1. Build a pure Python list of lists to satisfy PyBind11
+        pcs_list = []
         
-        for tree in range(self.N - 1):
+        # --- FIX: Read the exact truncation level from the C++ object ---
+        trunc_lvl = len(self.base_copula.pair_copulas)
+        
+        # Only loop up to the truncation level (e.g., 10 or 13)
+        for tree in range(trunc_lvl):
+            tree_list = []
             for edge in range(self.N - 1 - tree):
+                # Extract a copy of the Bicop from the original structure
+                pc = self.base_copula.get_pair_copula(tree, edge)
+                
                 m = self.models[f"T{tree}_E{edge}"]
                 if m:
+                    # Transform raw f_t into bounded theta_t
                     theta_oos = float(m.transform_parameter(m.oos_forecast).item())
-                    pc = pcs[tree][edge] # Access the exact Bicop object in the list
                     
                     if pc.parameters.shape[0] == 2:
                         nu = m.get_nu()
@@ -128,10 +140,20 @@ class DynamicVineWrapper:
                             
                         params = np.array([[theta_oos]])
                         
-                    # Modify the Bicop IN THE LIST
-                    pcs[tree][edge].parameters = params
+                    # Inject parameters into the extracted copy
+                    pc.parameters = params
+                
+                # Append the Bicop object to the inner list
+                tree_list.append(pc)
+                
+            # Append the tree list to the main list
+            pcs_list.append(tree_list)
                     
-        self.base_copula = pv.Vinecop(self.base_copula.structure, pcs)
+        # 2. RE-INSTANTIATE THE VINECOP
+        self.base_copula = pv.Vinecop.from_structure(
+            structure=self.base_copula.structure, 
+            pair_copulas=pcs_list
+        )
 
 class UniversalScenarioGenerator:
     def __init__(self, factor_order, copula_model, model_id):
